@@ -1,37 +1,95 @@
-import pyautogui
-import cv2
-import numpy as np
-import time
 import os
+import cv2
+import time
 import threading
+import numpy as np
+import pyautogui
+import keyboard
+from mss import mss
+import pygetwindow as gw
 
+# ========== Configurações ==========
 TEMPLATE_DIR = "templates"
 
-SPO_TEMPLATES = [
-    cv2.imread(os.path.join(TEMPLATE_DIR, "giant_frog_text.png")),
-    cv2.imread(os.path.join(TEMPLATE_DIR, "giant_frog_text_2.png")),
-]
+TEMPLATES = {
+    "frog_texts": ["giant_frog_text.png", "giant_frog_text_2.png"],
+    "hover_items": ["big_bones_hover_new.png", "adamant_arrow_hover.png"],
+    "bury": "bury_big_bones.png",
+    "big_bones_text": "big_bones_text.png",
+    "inventory_bone": "bone_icon.png",
+    "block": "big_frog_text.png",
+    "life_bar": "barra_vermelha_estendida.png",
+}
 
-HOVER_TEMPLATES = [
-    cv2.imread(os.path.join(TEMPLATE_DIR, "big_bones_hover_new.png")),
-    cv2.imread(os.path.join(TEMPLATE_DIR, "adamant_arrow_hover.png")),
-]
-
-BURY_TEMPLATE = cv2.imread(os.path.join(TEMPLATE_DIR, "bury_big_bones.png"))
-BIG_BONES_TEXT_TEMPLATE = cv2.imread(os.path.join(TEMPLATE_DIR, "big_bones_text.png"))
+TEMPLATES_LOADED = {
+    key: (
+        [cv2.imread(os.path.join(TEMPLATE_DIR, f)) for f in value]
+        if isinstance(value, list)
+        else cv2.imread(os.path.join(TEMPLATE_DIR, value))
+    )
+    for key, value in TEMPLATES.items()
+}
 
 FROG_LOWER = np.array([60, 200, 51])
 FROG_UPPER = np.array([61, 214, 69])
 
+DELAY_CICLO = 0.01
+TEMPO_MOUSE_PARADO = 1.0
+OFFSET_X_OSSO = 20
+TEMPO_ATAQUE = 5.0
+
 burying = threading.Event()
-acao_em_execucao = threading.Lock()
+ossos_ativos = threading.Event()
+ossos_ativos.set()
+acao_lock = threading.Lock()
+mouse_parado_desde = time.time()
+pos_anterior = pyautogui.position()
+
+# Detectar janela do RuneScape
+rs_window = gw.getWindowsWithTitle("Old School RuneScape")
+if not rs_window:
+    raise Exception(
+        "Janela do RuneScape não encontrada. Certifique-se que o jogo está aberto."
+    )
+rs_win = rs_window[0]
+
+CAPTURE_REGION = {
+    "left": rs_win.left,
+    "top": rs_win.top,
+    "width": rs_win.width,
+    "height": rs_win.height,
+}
+
+CENTRO_JANELA = (rs_win.left + rs_win.width // 2, rs_win.top + rs_win.height // 2)
 
 
-def detectar_template(img_bgr, templates, threshold=0.6):
+# ========== Funções ==========
+def tempo_mouse_parado():
+    global mouse_parado_desde, pos_anterior
+    atual = pyautogui.position()
+    if np.linalg.norm(np.subtract(atual, pos_anterior)) > 2:
+        mouse_parado_desde = time.time()
+        pos_anterior = atual
+    return time.time() - mouse_parado_desde >= TEMPO_MOUSE_PARADO
+
+
+def distancia(p1, p2):
+    return np.linalg.norm(np.subtract(p1, p2))
+
+
+def capturar_tela():
+    with mss() as sct:
+        img = np.array(sct.grab(CAPTURE_REGION))
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+
+def detectar_template(img, templates, threshold=0.5):
+    if not isinstance(templates, list):
+        templates = [templates]
     for template in templates:
         if template is None:
             continue
-        res = cv2.matchTemplate(img_bgr, template, cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(res)
         if max_val >= threshold:
             h, w = template.shape[:2]
@@ -39,111 +97,161 @@ def detectar_template(img_bgr, templates, threshold=0.6):
     return None
 
 
-def detectar_cores_sapos(img_bgr):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+def detectar_multiplos(img, template, threshold=0.5):
+    if template is None:
+        return []
+    res = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
+    loc = np.where(res >= threshold)
+    h, w = template.shape[:2]
+    return [(pt[0] + w // 2, pt[1] + h // 2) for pt in zip(*loc[::-1])]
+
+
+def detectar_sapos(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, FROG_LOWER, FROG_UPPER)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    locais = []
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if 400 < area < 5000:
-            M = cv2.moments(cnt)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
-                locais.append((cx, cy))
-    return locais
+    sapos = []
+    for c in contours:
+        if 400 < cv2.contourArea(c) < 5000 and cv2.moments(c)["m00"] != 0:
+            x = int(cv2.moments(c)["m10"] / cv2.moments(c)["m00"])
+            y = int(cv2.moments(c)["m01"] / cv2.moments(c)["m00"])
+            sapos.append((x, y))
+    return sapos
 
 
+def barra_vida_visivel():
+    img = capturar_tela()
+    pos = detectar_template(img, TEMPLATES_LOADED["life_bar"], threshold=0.8)
+    return pos is not None
+
+
+def esperar_barra_sumir(timeout=10):
+    inicio = time.time()
+    while time.time() - inicio < timeout:
+        if not barra_vida_visivel():
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ========== Loops ==========
 def loop_detectar_bury():
     tempo_sem_bury = 0
     while True:
-        img_bgr = cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR)
-        pos = detectar_template(img_bgr, [BURY_TEMPLATE])
-
+        if not ossos_ativos.is_set():
+            time.sleep(0.1)
+            continue
+        img = capturar_tela()
+        pos = detectar_template(img, TEMPLATES_LOADED["bury"])
         if pos:
-            with acao_em_execucao:
+            with acao_lock:
                 if not burying.is_set():
-                    print("🦴 Enterrar os ossos! Clicando...")
+                    print("🩴 Enterrando ossos...")
                     burying.set()
                 pyautogui.click()
                 tempo_sem_bury = 0
-        else:
-            if burying.is_set():
-                tempo_sem_bury += 0.2
-                if tempo_sem_bury >= 2.0:
-                    burying.clear()
-                    tempo_sem_bury = 0
-        time.sleep(0.2)
+        elif burying.is_set():
+            tempo_sem_bury += 0.1
+            if tempo_sem_bury >= 1.5:
+                burying.clear()
+                tempo_sem_bury = 0
+        time.sleep(0.05)
 
 
-def loop_sapo_hsv():
-    ultimo_click = 0
-    cooldown = 8
-
+def loop_principal():
+    sapos_confirmados = 0
+    alvo_atual = None
     while True:
-        if not burying.is_set():
-            tempo_atual = time.time()
-            if tempo_atual - ultimo_click < cooldown:
+        if not tempo_mouse_parado() or burying.is_set():
+            time.sleep(DELAY_CICLO)
+            continue
+
+        img = capturar_tela()
+        centro = (CAPTURE_REGION["width"] // 2, CAPTURE_REGION["height"] // 2)
+        sapos = detectar_sapos(img)
+        pos_osso = detectar_template(img, TEMPLATES_LOADED["big_bones_text"])
+        ossos = []
+        if pos_osso:
+            ossos.append(("ground", (pos_osso[0] + OFFSET_X_OSSO, pos_osso[1])))
+
+        pos_inv = detectar_multiplos(
+            img, TEMPLATES_LOADED["inventory_bone"], threshold=0.8
+        )
+
+        if len(pos_inv) >= 6:
+            ossos.extend(("inventory", pos) for pos in pos_inv)
+
+        candidatos = [("frog", p, distancia(centro, p)) for p in sapos] + [
+            (tipo, p, distancia(centro, p)) for tipo, p in ossos
+        ]
+
+        if alvo_atual:
+            candidatos.insert(0, alvo_atual)
+
+        while candidatos:
+            candidatos.sort(key=lambda x: x[2])
+            tipo, pos, _ = candidatos.pop(0)
+
+            with acao_lock:
+                pyautogui.moveTo(pos)
                 time.sleep(0.2)
-                continue
+                nova_img = capturar_tela()
 
-            img_bgr = cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR)
-            sapos = detectar_cores_sapos(img_bgr)
-            for x, y in sapos:
-                with acao_em_execucao:
-                    pyautogui.moveTo(x, y)
-                    time.sleep(0.2)
-                    nova_img = cv2.cvtColor(
-                        np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR
-                    )
-                    if detectar_template(nova_img, SPO_TEMPLATES):
-                        print("🐸 Sapo confirmado por texto! Clicando...")
+                if tipo == "frog":
+                    if detectar_template(
+                        nova_img, TEMPLATES_LOADED["frog_texts"], threshold=0.6
+                    ):
                         pyautogui.click()
-                        ultimo_click = time.time()
-                        break
-                    else:
-                        print("❌ Texto de sapo não confirmado. Pulando.")
-        time.sleep(0.2)
-
-
-def loop_ossos():
-    while True:
-        if not burying.is_set():
-            img_bgr = cv2.cvtColor(np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR)
-            pos = detectar_template(img_bgr, [BIG_BONES_TEXT_TEMPLATE])
-            if pos:
-                with acao_em_execucao:
-                    print("📍 Ossos no chão. Movendo cursor...")
-                    pyautogui.moveTo(pos[0] + 20, pos[1])
-                    time.sleep(0.3)
-                    for _ in range(5):
-                        confirm_img = cv2.cvtColor(
-                            np.array(pyautogui.screenshot()), cv2.COLOR_RGB2BGR
+                        sapos_confirmados += 1
+                        print(
+                            f"🐸 Total de sapos confirmados e atacados: {sapos_confirmados}"
                         )
-                        if detectar_template(confirm_img, HOVER_TEMPLATES):
-                            print("✅ Hover confirmado! Clicando duas vezes...")
-                            pyautogui.click()
-                            time.sleep(0.1)
-                            pyautogui.click()
-                            print("⏳ Aguardando antes de voltar a detectar sapos...")
-                            time.sleep(1.2)
-                            break
+                        alvo_atual = ("frog", pos, 0)
+                        esperar_barra_sumir(timeout=10)
+                        alvo_atual = None
+                        break
+                    elif detectar_template(
+                        nova_img, TEMPLATES_LOADED["block"], threshold=0.5
+                    ):
+                        alvo_atual = None
+                        break
+
+                elif tipo == "ground":
+                    if detectar_template(nova_img, TEMPLATES_LOADED["hover_items"]):
+                        pyautogui.click()
+                        alvo_atual = ("ground", pos, 0)
+                        break
+
+                elif tipo == "inventory":
+                    for pos_osso in pos_inv:
+                        pyautogui.moveTo(pos_osso)
                         time.sleep(0.1)
-                    else:
-                        print("❌ Hover não apareceu.")
-        time.sleep(0.1)
+                        pyautogui.click()
+                    alvo_atual = None
+                    break
+        time.sleep(DELAY_CICLO)
 
 
-# Início
+def loop_atalhos():
+    while True:
+        if keyboard.is_pressed("F8"):
+            if ossos_ativos.is_set():
+                ossos_ativos.clear()
+                print("🩴 Coleta de ossos DESATIVADA!")
+            else:
+                ossos_ativos.set()
+                print("🩴 Coleta de ossos ATIVADA!")
+            time.sleep(0.5)
+        time.sleep(0.05)
+
+
+# ========== Execução ==========
 print("🔁 Bot iniciado... Pressione CTRL+C para parar.")
 try:
     threading.Thread(target=loop_detectar_bury, daemon=True).start()
-    threading.Thread(target=loop_sapo_hsv, daemon=True).start()
-    threading.Thread(target=loop_ossos, daemon=True).start()
-
+    threading.Thread(target=loop_principal, daemon=True).start()
+    threading.Thread(target=loop_atalhos, daemon=True).start()
     while True:
         time.sleep(1)
-
 except KeyboardInterrupt:
     print("\n🛑 Execução finalizada pelo usuário.")
