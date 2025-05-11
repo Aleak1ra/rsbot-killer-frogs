@@ -160,6 +160,7 @@ def loop_detectar_bury():
 
 def loop_principal():
     sapos_confirmados = 0
+    bury_confirmados = 0
     alvo_atual = None
     while True:
         if not tempo_mouse_parado() or burying.is_set():
@@ -227,6 +228,8 @@ def loop_principal():
                         pyautogui.moveTo(pos_osso)
                         time.sleep(0.1)
                         pyautogui.click()
+                        bury_confirmados += 1
+                        print(f"🦴 Total de ossos enterrados: {bury_confirmados}")
                     alvo_atual = None
                     break
         time.sleep(DELAY_CICLO)
