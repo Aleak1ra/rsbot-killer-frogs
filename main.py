@@ -30,8 +30,10 @@ TEMPLATES_LOADED = {
     for key, value in TEMPLATES.items()
 }
 
-FROG_LOWER = np.array([60, 200, 51])
-FROG_UPPER = np.array([61, 214, 69])
+HUNTER_LOWER = np.array([14, 55, 45])
+HUNTER_UPPER = np.array([32, 205, 172])
+GRASS_LOWER = np.array([35, 40, 40])
+GRASS_UPPER = np.array([95, 255, 255])
 
 DELAY_CICLO = 0.01
 TEMPO_MOUSE_PARADO = 1.0
@@ -106,17 +108,23 @@ def detectar_multiplos(img, template, threshold=0.5):
     return [(pt[0] + w // 2, pt[1] + h // 2) for pt in zip(*loc[::-1])]
 
 
-def detectar_sapos(img):
+def detectar_hunters(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, FROG_LOWER, FROG_UPPER)
+    mask_kebbit = cv2.inRange(hsv, HUNTER_LOWER, HUNTER_UPPER)
+    mask_grass = cv2.inRange(hsv, GRASS_LOWER, GRASS_UPPER)
+    mask = cv2.bitwise_and(mask_kebbit, cv2.bitwise_not(mask_grass))
+    mask = cv2.medianBlur(mask, 5)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    sapos = []
+    hunters = []
     for c in contours:
-        if 400 < cv2.contourArea(c) < 5000 and cv2.moments(c)["m00"] != 0:
-            x = int(cv2.moments(c)["m10"] / cv2.moments(c)["m00"])
-            y = int(cv2.moments(c)["m01"] / cv2.moments(c)["m00"])
-            sapos.append((x, y))
-    return sapos
+        area = cv2.contourArea(c)
+        if 80 < area < 8000:
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                x = int(M["m10"] / M["m00"])
+                y = int(M["m01"] / M["m00"])
+                hunters.append((x, y))
+    return hunters
 
 
 def barra_vida_visivel():
@@ -169,7 +177,7 @@ def loop_principal():
 
         img = capturar_tela()
         centro = (CAPTURE_REGION["width"] // 2, CAPTURE_REGION["height"] // 2)
-        sapos = detectar_sapos(img)
+        sapos = detectar_hunters(img)
         pos_osso = detectar_template(img, TEMPLATES_LOADED["big_bones_text"])
         ossos = []
         if pos_osso:
