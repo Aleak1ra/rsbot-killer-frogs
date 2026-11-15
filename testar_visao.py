@@ -115,7 +115,8 @@ def testar_cliques():
 def testar_menus():
     """Recortes de menus abertos; "ok" = o bot achou a linha e o osso entrou no inventário."""
     falhas, n = [], 0
-    for caminho in sorted(glob.glob(os.path.join(PASTA, "menus", "*_ok.png"))):
+    menus = glob.glob(os.path.join(PASTA, "menus", "*_ok.png")) +         glob.glob(os.path.join(PASTA, "menus", "*_ok_osso.png"))  # antigos sem sufixo + gravados agora
+    for caminho in sorted(menus):
         n += 1
         ponto, score = visao.achar_take_no_menu(cv2.imread(caminho))
         if ponto is None:
@@ -124,10 +125,450 @@ def testar_menus():
     return falhas
 
 
+# ---------- Vida (orbe de Hitpoints) ----------
+CAPTURA = visao.CAPTURA_CALIBRADA[::-1]  # (altura, largura) de um frame inteiro
+TOLERANCIA_VIDA = 0.025
+# Caixas com o mesmo desenho da do orbe de vida (canto x, y). A moldura é idêntica; o
+# que as separa é pouco (2,07 no especial), por isso o limiar fica bem abaixo disso.
+OUTRAS_CAIXAS = {(1650, 222): "orbe de especial", (1610, 150): "orbe de oração",
+                 (1622, 191): "orbe de corrida"}
+# Onde o orbe de vida é pintado: o preenchimento esvazia de cima para baixo conforme a
+# vida cai e muda de cor com veneno. Nada daqui pode influenciar a leitura.
+ORBE_VIDA = (1646, 95, 1700, 146)
+
+
+SEM_FRAMES = (f"nenhum frame {CAPTURA[1]}x{CAPTURA[0]} em amostras/: os testes de vida não "
+              "testaram nada (rode `python main.py --amostras` com a janela maximizada)")
+
+
+def frames_jogo(passo=1):
+    """Frames inteiros da janela (tamanho calibrado) gravados em amostras/."""
+    frames = []
+    for caminho in sorted(glob.glob(os.path.join(PASTA, "*.png")))[::passo]:
+        img = cv2.imread(caminho)
+        if img is not None and img.shape[:2] == CAPTURA:
+            frames.append((os.path.basename(caminho), img))
+    return frames
+
+
+def deslocar(img, dx, dy, buf=None):
+    """Simula a captura deslocada: o que a área do orbe mostra se a janela andar (dx, dy).
+
+    Só a região em volta do orbe é copiada (é tudo o que vida_pct lê); o resto fica preto.
+    """
+    buf = np.zeros_like(img) if buf is None else buf
+    x1, y1, x2, y2 = 1590, 95, 1670, 150
+    buf[y1:y2, x1:x2] = img[y1 + dy:y2 + dy, x1 + dx:x2 + dx]
+    return buf
+
+
+def pintar_numero(img, matiz):
+    """Repinta o número do orbe com outro matiz (o jogo usa matiz = 60 x vida)."""
+    out = img.copy()
+    x1, y1, x2, y2 = visao.REGIAO_VIDA
+    rec = out[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(rec, cv2.COLOR_BGR2HSV)
+    numero = (hsv[..., 1] > 180) & (hsv[..., 2] > 150)
+    hsv[..., 0][numero] = matiz
+    rec[numero] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[numero]
+    return out
+
+
+def mexer_no_orbe(img, como, semente=0):
+    """Simula o que o orbe faz em jogo: esvaziar, ficar verde (veneno) ou qualquer coisa."""
+    out = img.copy()
+    x1, y1, x2, y2 = ORBE_VIDA
+    rec = out[y1:y2, x1:x2]
+    if como == "vazio":
+        rec[:] = (20, 18, 22)
+    elif como == "veneno":
+        b, g, r = (rec[..., i].astype(int) for i in range(3))
+        vermelho = r > g + 40
+        rec[vermelho] = rec[vermelho][:, [0, 2, 1]]  # troca vermelho por verde
+    elif como == "ruido":
+        rec[:] = np.random.default_rng(semente).integers(0, 256, rec.shape, dtype=np.uint8)
+    return out
+
+
+def testar_vida_amostras():
+    """Todo frame gravado em jogo tem o orbe no lugar: a vida tem que ser lida."""
+    falhas, lidas, difs = [], [], []
+    frames = frames_jogo()
+    if not frames:
+        return [SEM_FRAMES]
+    for nome, img in frames:
+        vida = visao.vida_pct(img)
+        difs.append(visao.diferenca_caixa_vida(img))
+        if vida is None:
+            falhas.append(f"{nome}: vida não lida (caixa {difs[-1]:.2f})")
+        else:
+            lidas.append(vida)
+    if lidas:
+        print(f"Vida: {len(lidas)} frames lidos ({min(lidas):.0%} a {max(lidas):.0%}); "
+              f"caixa no lugar difere no máximo {max(difs):.2f} (limiar {visao.CAIXA_VIDA_LIMIAR})")
+    return falhas
+
+
+def testar_vida_baixa():
+    """Vida baixa simulada (número repintado) com o orbe em vários estados."""
+    falhas, n = [], 0
+    casos = [(round(60 * v), v) for v in (1.0, 0.75, 0.6, 0.5, 0.45, 0.39, 0.28, 0.15, 0.05, 0.0)]
+    casos.append((179, 0.0))  # vermelho "do outro lado" do círculo de matiz
+    frames = frames_jogo(passo=15)
+    if not frames:
+        return [SEM_FRAMES]
+    for nome, img in frames:
+        for como in ("igual", "vazio", "veneno", "ruido"):
+            base = mexer_no_orbe(img, como, semente=n)
+            for matiz, esperado in casos:
+                n += 1
+                vida = visao.vida_pct(pintar_numero(base, matiz))
+                if vida is None or abs(vida - esperado) > TOLERANCIA_VIDA:
+                    falhas.append(f"{nome} (orbe {como}, matiz {matiz}): esperado "
+                                  f"{esperado:.0%}, lido {vida if vida is None else f'{vida:.0%}'}")
+        # Número com duas cores não é o número do orbe (o jogo pinta tudo de uma cor só)
+        bicolor = pintar_numero(img, 17)
+        x1, y1, x2, y2 = visao.REGIAO_VIDA
+        meio = (x1 + x2) // 2
+        bicolor[:, meio:] = pintar_numero(img, 55)[:, meio:]
+        n += 1
+        vida = visao.vida_pct(bicolor)
+        if vida is not None:
+            falhas.append(f"{nome}: número com duas cores lido como {vida:.0%} (esperado nada)")
+    print(f"Vida baixa simulada: {n} leituras (número repintado; orbe cheio, vazio, "
+          "envenenado e com ruído; número com duas cores)")
+    return falhas
+
+
+def testar_vida_deslocada():
+    """O conserto em si: com a janela fora do lugar, vida_pct não pode devolver nada.
+
+    Todos os deslocamentos até ±60 px (inclui os 43 px da sessão de 14/11 21:10 que
+    pausou o bot à toa). A ±1 px o número continua dentro da área lida: ali só se exige
+    que, se ler, leia certo.
+    """
+    falhas, n = [], 0
+    frames = frames_jogo(passo=45)
+    if not frames:
+        return [SEM_FRAMES]
+    for nome, img in frames:
+        certa = visao.vida_pct(img)
+        buf = np.zeros_like(img)
+        lidas_fora = 0
+        for dy in range(-60, 61):
+            for dx in range(-60, 61):
+                if dx == 0 and dy == 0:
+                    continue
+                n += 1
+                vida = visao.vida_pct(deslocar(img, dx, dy, buf))
+                if vida is None:
+                    continue
+                if abs(dx) > 1 or abs(dy) > 1:
+                    lidas_fora += 1
+                    if lidas_fora <= 3:
+                        falhas.append(f"{nome}: janela deslocada ({dx}, {dy}) leu vida {vida:.0%}")
+                elif abs(vida - certa) > TOLERANCIA_VIDA:
+                    falhas.append(f"{nome}: deslocada ({dx}, {dy}) leu {vida:.0%}, certo {certa:.0%}")
+        if lidas_fora > 3:
+            falhas.append(f"{nome}: ... {lidas_fora} deslocamentos leram alguma vida")
+    print(f"Janela deslocada: {n} leituras (±60 px em {len(frames)} frames)")
+    return falhas
+
+
+def mapa_caixa(img):
+    """Diferença da caixa do orbe em TODAS as posições da imagem (canto x, y)."""
+    m = visao.CAIXA_VIDA_MASCARA
+    ref = visao.CAIXA_VIDA_REF.astype(np.uint8)
+    h, w = m.shape
+    hs, ws = img.shape[0] - h + 1, img.shape[1] - w + 1
+    acc = np.zeros((hs, ws), np.int32)
+    canais = cv2.split(img)
+    pixels = list(zip(*np.where(m)))
+    for y, x in pixels:
+        for c in range(3):
+            v = canais[c][y:y + hs, x:x + ws]
+            acc += cv2.absdiff(v, np.full_like(v, ref[y, x, c]))
+    return acc / (3.0 * len(pixels))
+
+
+def testar_vida_cenario():
+    """Em nenhuma outra posição da imagem a moldura da caixa do orbe pode 'bater'.
+
+    Calcula a diferença da caixa em todas as posições de cada frame (o cenário inteiro,
+    as caixas dos outros orbes, que têm o mesmo desenho, e a própria caixa deslocada).
+    Só a posição certa pode passar (±1 px, onde o número continua dentro da área lida e
+    a leitura tem que sair igual). O mapa é conferido contra visao.diferenca_caixa_vida.
+    """
+    falhas, n_janelas = [], 0
+    menor = {"resto da imagem": float("inf"), **{nome: float("inf") for nome in OUTRAS_CAIXAS.values()}}
+    cx, cy = visao.CAIXA_VIDA[:2]
+    frames = frames_jogo(passo=30)
+    if not frames:
+        return [SEM_FRAMES]
+    for nome, img in frames:
+        mapa = mapa_caixa(img)
+        n_janelas += mapa.size
+        verdadeira = visao.vida_pct(img)
+        # o mapa deste teste tem que dar o mesmo que a função usada pelo bot
+        for (px, py) in [(cx, cy), (cx + 5, cy), (cx, cy + 3)] + list(OUTRAS_CAIXAS):
+            real = visao.diferenca_caixa_vida(deslocar(img, px - cx, py - cy))
+            if abs(real - mapa[py, px]) > 1e-3:
+                falhas.append(f"{nome}: mapa_caixa ({mapa[py, px]:.3f}) difere de "
+                              f"visao.diferenca_caixa_vida ({real:.3f}) em ({px}, {py})")
+        ys, xs = np.where(mapa <= visao.CAIXA_VIDA_LIMIAR)
+        for x, y in zip(xs, ys):
+            dx, dy = int(x) - cx, int(y) - cy
+            if abs(dx) > 1 or abs(dy) > 1:
+                onde = OUTRAS_CAIXAS.get((int(x), int(y)), "cenário")
+                falhas.append(f"{nome}: {onde} em ({x}, {y}) passa por caixa do orbe de vida "
+                              f"(diferença {mapa[y, x]:.2f})")
+                continue
+            # janela 1 px fora do lugar: se a caixa passar, a leitura tem que sair certa
+            vida = visao.vida_pct(deslocar(img, dx, dy))
+            if vida is not None and abs(vida - verdadeira) > TOLERANCIA_VIDA:
+                falhas.append(f"{nome}: deslocado ({dx}, {dy}) leu {vida:.0%}, "
+                              f"certo {verdadeira:.0%}")
+        fora = mapa.copy()
+        fora[cy - 1:cy + 2, cx - 1:cx + 2] = np.inf
+        for (ox, oy), orbe in OUTRAS_CAIXAS.items():
+            menor[orbe] = min(menor[orbe], float(fora[oy, ox]))
+            fora[oy - 1:oy + 2, ox - 1:ox + 2] = np.inf
+        menor["resto da imagem"] = min(menor["resto da imagem"], float(fora.min()))
+    print(f"Vida no cenário: {n_janelas} posições em {len(frames)} frames; menor diferença "
+          f"fora da caixa certa: " + ", ".join(f"{k} {v:.2f}" for k, v in menor.items())
+          + f" (limiar {visao.CAIXA_VIDA_LIMIAR})")
+    return falhas
+
+
+def testar_vigia_vida():
+    """Pausa/retomada: uma leitura isolada nunca pausa nem retoma o bot."""
+    casos = [
+        ("leitura baixa isolada", [0.9, 0.28, 0.9, 0.9], [None] * 4),
+        ("três baixas seguidas", [0.35, 0.3, 0.2], [None, None, "pausar"]),
+        ("None não zera a contagem", [0.3, None, 0.3, None, 0.3],
+         [None, None, None, None, "pausar"]),
+        ("leitura boa no meio zera", [0.3, 0.3, 0.5, 0.3, 0.3], [None] * 5),
+        ("40% exatos não é baixa", [0.40] * 4, [None] * 4),
+        ("pausado: 59% não retoma", [0.3, 0.3, 0.3, 0.59, 0.59, 0.59, 0.59],
+         [None, None, "pausar", None, None, None, None]),
+        ("pausado: retoma com 3 leituras >= 60%", [0.3, 0.3, 0.3, 0.6, 0.9, 0.7],
+         [None, None, "pausar", None, None, "retomar"]),
+        ("pausado: leitura alta isolada não retoma", [0.3, 0.3, 0.3, 0.9, 0.3, 0.9, 0.9],
+         [None, None, "pausar", None, None, None, None]),
+        ("ciclo completo duas vezes", [0.1] * 3 + [1.0] * 3 + [0.1] * 3,
+         [None, None, "pausar", None, None, "retomar", None, None, "pausar"]),
+        # main.py descarta a leitura que não se confirmou na hora: não sobra contagem
+        ("descartada não soma depois", [0.3, 0.3, "descartar", 0.3, 0.3],
+         [None, None, None, None, None]),
+        ("descartar pausado não retoma", [0.3, 0.3, 0.3, 0.9, 0.9, "descartar", 0.9],
+         [None, None, "pausar", None, None, None, None]),
+    ]
+    falhas = []
+    for nome, leituras, esperado in casos:
+        vigia = visao.VigiaVida(0.40, 0.60, 3)
+        obtido = [vigia.descartar() if v == "descartar" else vigia.ler(v) for v in leituras]
+        if obtido != esperado:
+            falhas.append(f"VigiaVida ({nome}): esperado {esperado}, obtido {obtido}")
+    print(f"Pausa por vida: {len(casos)} sequências")
+    return falhas
+
+
+# ---------- Itens do chão: runas e moedas ----------
+# Gabaritos em amostras/runas/ (conferidos a olho nas montagens): esperado.json (runas)
+# e esperado_moedas.json, para os quadros de amostras/runas/ e os de amostras/ ("../").
+GABARITOS_CHAO = {"runa": "esperado.json", "moedas": "esperado_moedas.json"}
+# Menus gravados com a linha "Take <item>": y do "Take" esperado. Os outros não podem ter.
+MENUS_COM_ITEM = {
+    "runa": {"151929_001_ok.png": 374, "152556_019_ok.png": 397, "152805_003_ok.png": 374,
+             "152957_008_ok.png": 374, "153257_016_ok.png": 374},
+    "moedas": {"152126_008_ok.png": 374, "152251_011_ok.png": 374, "152330_013_ok.png": 374,
+               "152412_015_ok.png": 374, "152456_016_ok.png": 374, "152623_022_ok.png": 374,
+               "152723_001_ok.png": 374, "152921_006_ok.png": 374, "152940_007_ok.png": 374,
+               "152957_008_ok.png": 398, "153019_009_ok.png": 374, "153033_010_ok.png": 374,
+               "153220_015_ok.png": 374, "153350_018_ok.png": 374, "153413_019_ok.png": 398,
+               "153436_020_ok.png": 374},
+}
+MENUS_COM_RUNA = MENUS_COM_ITEM["runa"]
+TOLERANCIA_ROTULO = 4
+TOLERANCIA_PILHA = 4
+
+
+def testar_item_chao(item):
+    """Rótulos do item no chão contra o gabarito: todos os visíveis, nenhum a mais, e a
+    pilha certa (na pilha de um osso, o clique vai no mesmo ponto do osso)."""
+    pasta = os.path.join(PASTA, "runas")
+    caminho = os.path.join(pasta, GABARITOS_CHAO[item])
+    if not os.path.exists(caminho):
+        return [f"sem amostras/runas/{GABARITOS_CHAO[item]}: o teste de {item} não testou nada"]
+    with open(caminho, encoding="utf-8") as f:
+        esperado = json.load(f)
+    falhas, n_rot, n_pilha_osso, encobertas = [], 0, 0, 0
+    perto = lambda a, b, tol: abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol  # noqa: E731
+    for nome, exp in esperado.items():
+        img = cv2.imread(os.path.join(pasta, nome))
+        if img is None:
+            falhas.append(f"runas/{nome}: imagem não encontrada")
+            continue
+        mascara = visao.mascara_rotulos(img)
+        ossos = visao.detectar_ossos_chao(img, mascara=mascara)
+        achados = visao.detectar_itens_chao(img, item, ossos=ossos, mascara=mascara)
+        for e, p in zip(exp["rotulos"], exp["pilhas"]):
+            n_rot += 1
+            r = next((r for r in achados if perto(r["rotulo"], e, TOLERANCIA_ROTULO)), None)
+            if r is None:
+                falhas.append(f"{item} em runas/{nome}: rótulo em {e} não detectado")
+            elif not perto(r["pos"], p, TOLERANCIA_PILHA):
+                falhas.append(f"{item} em runas/{nome}: pilha em {r['pos']}, esperado {p}")
+        for r in achados:
+            if not any(perto(r["rotulo"], e, TOLERANCIA_ROTULO) for e in exp["rotulos"]):
+                falhas.append(f"{item} em runas/{nome}: rótulo a mais em {r['rotulo']}")
+            o = [o["pos"] for o in ossos if abs(o["pos"][0] - r["pos"][0]) <= 12
+                 and abs(o["pos"][1] - r["pos"][1]) <= 12]
+            if o:
+                n_pilha_osso += 1
+                if not perto(r["pos"], o[0], 3):
+                    falhas.append(f"{item} em runas/{nome}: pilha {r['pos']} longe do osso {o[0]}")
+        encobertas += len(exp.get("encobertas", []))
+    print(f"{item.capitalize()} no chão: {n_rot} rótulos em {len(esperado)} frames ({n_pilha_osso} na "
+          f"pilha de um osso); {encobertas} encoberto(s) por outro rótulo, não exigido(s)")
+    return falhas
+
+
+def testar_item_menu(item):
+    """Linha "Take <item>" nos menus gravados: só onde tem, e nunca no "Examine".
+
+    Menus antigos (HHMMSS_NNN_ok.png, de osso): gabarito MENUS_COM_ITEM. Menus gravados
+    pela coleta (HHMMSS_NNN_ok_<item>.png): o bot achou e clicou a linha daquele item,
+    então ela tem que ser achada de novo; sobre os outros itens não se afirma nada.
+    """
+    falhas, n = [], 0
+    esperados = MENUS_COM_ITEM[item]
+    itens = tuple(visao.ITENS_CHAO) + ("osso",)  # sufixos dos menus gravados pela coleta
+    for caminho in sorted(glob.glob(os.path.join(PASTA, "menus", "*.png"))):
+        nome = os.path.basename(caminho)
+        de_coleta = nome[:-4].endswith(itens)
+        if de_coleta and not nome.endswith(f"_ok_{item}.png"):
+            continue
+        n += 1
+        ponto, score = visao.achar_take_item_no_menu(cv2.imread(caminho), item)
+        if de_coleta:
+            if ponto is None:
+                falhas.append(f"menus/{nome}: linha Take <{item}> não achada ({score:.2f})")
+        elif nome in esperados:
+            if ponto is None:
+                falhas.append(f"menus/{nome}: linha Take <{item}> não achada ({score:.2f})")
+            elif abs(ponto[1] - esperados[nome]) > 3:
+                falhas.append(f"menus/{nome}: escolheu a linha em y={ponto[1]}, esperado {esperados[nome]}")
+        elif ponto is not None:
+            falhas.append(f"menus/{nome}: achou Take <{item}> onde não tem ({score:.2f} em {ponto})")
+    print(f"Menus ({item}): {n}, {len(esperados)} com a linha Take")
+    if n == 0:
+        falhas.append(f"sem menus gravados em amostras/menus: o teste de {item} no menu não testou nada")
+    return falhas
+
+
+def testar_rotulo_vizinho():
+    """Rótulo de outra pilha encostado ou encavalado no da runa (montado com rótulos reais).
+
+    Antes o centro vinha da extensão da linha branca, que engolia o vizinho e tirava o
+    clique da pilha (60-75 px). Agora: ou acha a pilha certa, ou ignora a runa. "Certa" =
+    a até 12 px (um quarto do quadrado do chão, ~50 px: o menu da pilha abre de qualquer
+    ponto do quadrado); encavalado 10 px por cima, o centro sai 7-9 px.
+    """
+    base = cv2.imread(os.path.join(PASTA, "runas", "230455_0051.png"))
+    fonte = cv2.imread(os.path.join(PASTA, "152957_osso_ok_8.png"))
+    if base is None or fonte is None:
+        return ["sem as imagens do teste de rótulo vizinho (runas/230455_0051, 152957_osso_ok_8)"]
+    certa = (942, 617)  # pilha da "Law rune x 2 (238 gp)" sem vizinho
+    rot = fonte[411:433, 732:876]  # "Iron arrow x 3 (9 gp)"
+    tinta = (rot.min(axis=2) > 160) | (rot.max(axis=2) < 25)  # letras e sombra
+    binm, _ = visao.mascara_rotulos(base)
+    linhas = np.flatnonzero(binm[591:613, 871:1020].any(axis=1))
+    topo, esq, dir_ = 591 + linhas[0], 871, 1019  # extensão do rótulo da runa
+    falhas, n, achou = [], 0, 0
+    for lado in ("esquerda", "direita"):
+        for folga in (-20, -10, 4, 6, 7, 8):  # negativo = encavalado
+            for dy in (0, -5, 5):
+                img = base.copy()
+                x0 = esq - folga - rot.shape[1] if lado == "esquerda" else dir_ + folga + 1
+                y0 = topo - 1 + dy
+                reg = img[y0:y0 + rot.shape[0], x0:x0 + rot.shape[1]]
+                reg[tinta] = rot[tinta]
+                n += 1
+                runas = [r for r in visao.detectar_runas_chao(img) if abs(r["rotulo"][1] - 593) <= 6]
+                for r in runas:
+                    achou += 1
+                    if abs(r["pos"][0] - certa[0]) > 12 or abs(r["pos"][1] - certa[1]) > 12:
+                        falhas.append(f"rótulo vizinho à {lado} (folga {folga}, dy {dy}): pilha em "
+                                      f"{r['pos']}, certa {certa}")
+    print(f"Rótulo vizinho: {n} montagens, runa achada no lugar certo em {achou} (nas outras, ignorada)")
+    return falhas
+
+
+def testar_menu_tem_take():
+    """Menu em que o bot achou e clicou a linha (*_ok*.png) tem "Take"; os de clique em
+    quadrado vazio gravados como falha (_sem, sem nenhum Take) não. É o que decide a
+    segunda tentativa uma linha abaixo (main.pegar_pelo_menu_pilha)."""
+    falhas, n = [], 0
+    vazios = {"151931_002_sem.png", "151949_004_sem.png", "152559_020_sem.png"}
+    for caminho in sorted(glob.glob(os.path.join(PASTA, "menus", "*.png"))):
+        nome = os.path.basename(caminho)
+        if "_ok" not in nome and nome not in vazios:
+            continue
+        n += 1
+        tem = visao.menu_tem_take(cv2.imread(caminho))
+        if tem != ("_ok" in nome):
+            falhas.append(f"menus/{nome}: menu_tem_take = {tem}")
+    print(f"Menu com/sem Take: {n} menus")
+    return falhas
+
+
+def testar_runas_chao():
+    return testar_item_chao("runa")
+
+
+def testar_runas_menu():
+    return testar_item_menu("runa")
+
+
+# ---------- Geometria da janela ----------
+def testar_geometria():
+    """Onde capturar dada a área do jogo na tela (medido: maximizada = (0, 29, 1920, 1121))."""
+    casos = [
+        ("maximizada (calibração)", (0, 29, 1920, 1121), (-9, -9), False),
+        ("mesma janela movida", (300, 150, 1920, 1121), (291, 112), False),
+        ("posição negativa (outro monitor)", (-1920, 29, 1920, 1121), (-1929, -9), False),
+        ("restaurada, mais larga", (-45, 22, 1926, 1121), None, True),
+        ("restaurada, menor", (100, 100, 1280, 720), None, True),
+        ("1 px mais baixa", (0, 29, 1920, 1120), None, True),
+        ("minimizada", (0, 0, 0, 0), None, True),
+    ]
+    falhas = []
+    for nome, cliente, esperado, problema in casos:
+        left, top, msg = visao.alinhar_captura(cliente)
+        if (msg is not None) != problema:
+            falhas.append(f"geometria ({nome}): problema esperado={problema}, obtido {msg!r}")
+        if esperado is not None and (left, top) != esperado:
+            falhas.append(f"geometria ({nome}): captura em {(left, top)}, esperado {esperado}")
+    # A posição calibrada das coisas fixas tem que bater com a área do jogo
+    cx, cy, cw, ch = visao.CLIENTE_CALIBRADO
+    if (cx + cw + cx, cy + ch + cx) != visao.CAPTURA_CALIBRADA:
+        falhas.append(f"geometria: captura {visao.CAPTURA_CALIBRADA} não fecha com a área "
+                      f"do jogo {visao.CLIENTE_CALIBRADO} + bordas")
+    print(f"Geometria da janela: {len(casos)} casos")
+    return falhas
+
+
 if __name__ == "__main__":
     if not os.path.isdir(PASTA):
         sys.exit("Sem amostras: rode `python main.py --amostras` primeiro.")
     falhas = testar_frames() + testar_faixas() + testar_cliques() + testar_menus()
+    falhas += testar_vida_amostras() + testar_vida_baixa() + testar_vida_deslocada()
+    falhas += testar_vida_cenario()
+    falhas += testar_vigia_vida() + testar_geometria()
+    for item in visao.ITENS_CHAO:
+        falhas += testar_item_chao(item) + testar_item_menu(item)
+    falhas += testar_rotulo_vizinho() + testar_menu_tem_take()
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:
