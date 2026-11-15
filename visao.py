@@ -60,7 +60,9 @@ PAINEL_OPONENTE = (17, 94, 194, 116)
 INVENTARIO = (1570, 780, 1880, 1125)
 # Só a área dos espaços de itens, sem as pilastras de pedra das laterais (lá a imagem varia
 # uns poucos px de um quadro para outro sem nada mudar no inventário)
-INVENTARIO_ITENS = (INVENTARIO[0] + 14, INVENTARIO[1], INVENTARIO[2] - 14, INVENTARIO[3])
+# Também sem as 10 linhas de cima: ali aparece o realce da aba do painel (visto em 15/11: 14 de
+# 18 "coletas" confirmadas rápido demais eram só as linhas 780-787 mudando, não um item).
+INVENTARIO_ITENS = (INVENTARIO[0] + 14, INVENTARIO[1] + 10, INVENTARIO[2] - 14, INVENTARIO[3])
 # Áreas onde não existe mundo 3D: candidatos ali são descartados
 AREAS_INTERFACE = [
     (1570, 740, 1940, 1170),  # inventário e abas
