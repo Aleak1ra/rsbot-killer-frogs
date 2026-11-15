@@ -31,6 +31,8 @@ try:  # embutido (visao.PERFIS) ou aprendido com ensinar.py (perfis/<nome>.json)
     PERFIL = visao.carregar_perfil(NOME_PERFIL)
 except KeyError:
     sys.exit(f"Monstro desconhecido: {NOME_PERFIL}. Opções: {', '.join(visao.perfis_disponiveis())}")
+except ValueError as erro:  # perfis/<nome>.json existe mas está incompleto ou estragado
+    sys.exit(f"Perfil {NOME_PERFIL} com problema: {erro}")
 
 # ========== Configurações ==========
 TITULO_JANELA = "Old School RuneScape"
@@ -979,7 +981,9 @@ def loop_principal():
 def loop_atalhos():
     while True:
         if keyboard.is_pressed("F8"):
-            if ossos_ativos.is_set():
+            if not PERFIL.get("osso", True):
+                print(f"🩴 {PERFIL['nome']} não larga 'Big bones' (perfil sem osso): F8 não faz nada")
+            elif ossos_ativos.is_set():
                 ossos_ativos.clear()
                 print("🩴 Coleta de ossos DESATIVADA!")
             else:
@@ -1004,10 +1008,14 @@ def executar_principal():
 # ========== Execução ==========
 if __name__ == "__main__":
     print(f"🔁 Bot iniciado — alvo: {PERFIL['nome']}. Pressione CTRL+C para parar.")
-    print("   (só age com o jogo em primeiro plano; F8 liga/desliga os ossos)")
+    if PERFIL.get("osso", True):
+        print("   (só age com o jogo em primeiro plano; F8 liga/desliga os ossos)")
+    else:
+        print("   (só age com o jogo em primeiro plano; perfil sem osso: não pega nem enterra ossos)")
     if SEM_VIDA:
         print("   pausa por vida baixa DESLIGADA (--sem-vida)")
-    print("   pega do chão: " + (", ".join(c.plural for c in COLETAS if c.ligado) or "nada além dos ossos"))
+    sem_itens = "nada além dos ossos" if PERFIL.get("osso", True) else "nada"
+    print("   pega do chão: " + (", ".join(c.plural for c in COLETAS if c.ligado) or sem_itens))
     print(f"   log: {LOG.caminho}")
     try:
         threading.Thread(target=executar_principal, daemon=True).start()

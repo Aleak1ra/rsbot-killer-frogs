@@ -3,18 +3,18 @@
   "cor": [
     [
       11,
-      101,
-      94
+      105,
+      93
     ],
     [
       19,
       136,
-      217
+      215
     ]
   ],
   "area": [
-    312,
-    4992
+    297,
+    4760
   ],
   "fechar": 5,
   "espera_loot": 4.5,
@@ -29,7 +29,7 @@
   },
   "aprendido": {
     "exemplos": 4,
-    "area_ref": 1248.0,
+    "area_ref": 1190.0,
     "caixa_ref": [
       37,
       70
@@ -42,6 +42,6 @@
     42
   ],
   "raio_mira": 133,
-  "area_mira": 312,
+  "area_mira": 298,
   "exemplos": "hillgiant_aprendido_exemplos"
 }

@@ -14,6 +14,7 @@ Medido offline nas amostras de hoje (Hill Giant e Giant frog reaprendidos assim)
 """
 import json
 import os
+import shutil
 
 import cv2
 import numpy as np
@@ -41,12 +42,13 @@ def _linha_texto(tinta):
     return y1, y2
 
 
-def gerar_molde_texto(faixa, com_nivel=True):
+def gerar_molde_texto(faixa):
     """Molde do texto de ação "Attack <Nome> (level-N)" a partir de UMA faixa.
 
-    `faixa`: recorte FAIXA_TEXTO_ACAO com o mouse sobre o monstro. Devolve (molde, nome_px,
-    motivo): molde em visao.mascara_texto_geral (None se a faixa não serve; `motivo` diz por
-    quê). Com com_nivel=False o molde para no nome (aceita o monstro em qualquer nível).
+    `faixa`: recorte FAIXA_TEXTO_ACAO com o mouse sobre o monstro. Devolve (molde, motivo):
+    molde em visao.mascara_texto_geral, ou None se a faixa não serve (`motivo` diz por quê).
+    O molde inclui o nível: parar no nome aceitaria outro monstro cujo nome começa igual
+    ("Cow" pegaria "Cow calf"), visto na revisão.
     """
     m = visao.mascara_texto_geral(faixa)
     tinta = m > 100
@@ -73,13 +75,6 @@ def gerar_molde_texto(faixa, com_nivel=True):
             float(cv2.matchTemplate(verbo, ATAQUE, cv2.TM_CCOEFF_NORMED).max()) < ATAQUE_LIMIAR:
         return None, "o texto não começa com 'Attack' (o mouse está sobre o monstro?)"
     x_fim = int(cc[-1])
-    if not com_nivel:
-        # só o nome (amarelo), sem o "(level-N)", que tem outra cor
-        b, g, r = p[:, :, 0], p[:, :, 1], p[:, :, 2]
-        amarelo = (r > 200) & (g > 200) & (b < 90)
-        ca = np.flatnonzero(amarelo[y1:y2 + 1, cols[0]:fim_trecho + 1].any(axis=0)) + cols[0]
-        if len(ca):
-            x_fim = int(ca[-1])
     molde = m[max(y1 - 2, 0):min(y2 + 3, m.shape[0]), max(int(cols[0]) - 2, 0):x_fim + 3].copy()
     return molde, None
 
@@ -99,6 +94,12 @@ VAZAMENTO_FATOR = 4.0  # mancha maior que isso x a área do monstro conta como v
 MARGEM_CAIXA = (1, 6, 10)  # folga H, S, V em volta dos percentis 2-98 da região
 FECHAR = 5
 FATOR_AREA = (0.25, 4.0)
+S_CINZA = 40  # saturação abaixo disso: cor quase cinza, o matiz não decide
+S_GRUPO = 20  # ±S em volta da semente: com 30 o chão encostado alargava a região (revisão)
+REGIAO_MIN = 40  # px: região de cor menor que isso não serve de exemplo
+REGIAO_MAX = 0.04  # fração da área 3D: região maior que isso é o chão, não o monstro
+AREA_REF_MIN = 200  # px: piso da área de referência (a mínima aceita fica >= 50 px)
+AMOSTRA_REGIAO = 2000  # px por exemplo nos percentis da caixa
 MATIZ_BORDA = 10  # cor a até isso da volta 0/179 do matiz (vermelhos): aprende com o matiz girado
 
 
@@ -152,28 +153,56 @@ def _desloc_matiz(exemplos):
     return int(round(90 - h0)) % 180
 
 
-def _regiao_semente(hsv, pos, m3):
-    """Pixels HSV da região de cor parecida ligada ao ponto, e (h0, s0, tamanho)."""
+def _regiao_semente(hsv, pos, m3, m3_area):
+    """Pixels HSV da região de cor parecida ligada ao ponto, e (h0, s0, tamanho); (None,
+    motivo) se o ponto não serve.
+
+    Cor-semente: a dominante num disco de R_MIOLO px em volta do ponto (resiste a cair num
+    detalhe, como a tanga do gigante). Se essa cor se espalhar pela tela (clique na borda do
+    corpo: o disco é quase todo chão) ou não formar região, tenta a cor sob o cursor (5x5),
+    que o texto de ação garante ser do monstro. Em monstro cinza o matiz é ruído e não conta."""
     x, y = pos
+    alt, larg = hsv.shape[:2]
+    if not (R_MIOLO <= x < larg - R_MIOLO and R_MIOLO <= y < alt - R_MIOLO):
+        return None, "ponto na borda da tela"
     yy, xx = np.ogrid[-R_MIOLO:R_MIOLO + 1, -R_MIOLO:R_MIOLO + 1]
     disco = (xx * xx + yy * yy) <= R_MIOLO * R_MIOLO
-    miolo = hsv[y - R_MIOLO:y + R_MIOLO + 1, x - R_MIOLO:x + R_MIOLO + 1]
-    if miolo.shape[:2] != disco.shape:
-        return None, None
-    core = miolo[disco].astype(int)
-    h0, s0 = np.median(core[:, 0]), np.median(core[:, 1])
-    # só o grupo de cor dominante do miolo (tira olho, roupa, chão que aparece)
-    core = core[(np.abs(core[:, 0] - h0) <= 3) & (np.abs(core[:, 1] - s0) <= 30)]
-    dh = max(3, int(np.ceil(np.percentile(np.abs(core[:, 0] - h0), 90))) + 1)
-    ds = max(14, int(np.ceil(np.percentile(np.abs(core[:, 1] - s0), 90))) + 6)
-    vmin = max(20, int(np.percentile(core[:, 2], 5)) - 60)
+    miolo = hsv[y - R_MIOLO:y + R_MIOLO + 1, x - R_MIOLO:x + R_MIOLO + 1][disco].astype(int)
+    centro = hsv[y - 2:y + 3, x - 2:x + 3].reshape(-1, 3).astype(int)
     H, S, V = (hsv[..., i].astype(int) for i in range(3))
-    cand = ((np.abs(H - h0) <= dh) & (np.abs(S - s0) <= ds) & (V >= vmin)).astype(np.uint8) * 255
-    cand &= m3
-    reg, _ = _comp_no_ponto(cand, pos)
-    if reg is None:
-        return None, None
-    return hsv[reg], (float(h0), float(s0), int(reg.sum()))
+    motivo = "cor do cursor sem vizinhos parecidos (mouse na borda do monstro?)"
+    for semente in (miolo, centro):
+        h0, s0 = float(np.median(semente[:, 0])), float(np.median(semente[:, 1]))
+        cinza = s0 < S_CINZA
+        perto = np.abs(miolo[:, 1] - s0) <= S_GRUPO
+        if not cinza:
+            perto &= np.abs(miolo[:, 0] - h0) <= 3
+        core = miolo[perto]
+        if len(core) < 10:
+            continue
+        dh = 90 if cinza else max(3, int(np.ceil(np.percentile(np.abs(core[:, 0] - h0), 90))) + 1)
+        ds = max(14, int(np.ceil(np.percentile(np.abs(core[:, 1] - s0), 90))) + 6)
+        vmin = max(20, int(np.percentile(core[:, 2], 5)) - 60)
+        cand = ((np.abs(H - h0) <= dh) & (np.abs(S - s0) <= ds) & (V >= vmin)).astype(np.uint8) * 255
+        cand &= m3
+        reg, _ = _comp_no_ponto(cand, pos)
+        n = 0 if reg is None else int(reg.sum())
+        if n < REGIAO_MIN:
+            motivo = f"região de cor pequena demais ({n} px): ponha o mouse no meio do corpo"
+            continue
+        if n > REGIAO_MAX * m3_area:
+            motivo = "a cor do ponto se espalha pela tela (chão?): ponha o mouse no meio do corpo"
+            continue
+        return hsv[reg], (h0, s0, n)
+    return None, motivo
+
+
+def checar_exemplo(img, pos):
+    """None se o ponto (mouse sobre o monstro) serve de exemplo de cor; senão o motivo."""
+    m3 = mascara_3d(img.shape)
+    hsv = visao.hsv_monstro(img, _desloc_matiz([(img, pos)]))
+    r, motivo = _regiao_semente(hsv, pos, m3, float((m3 > 0).sum()))
+    return None if r is not None else motivo
 
 
 def _vazamento(hsv, cor, a_ref, m3, m3_area):
@@ -256,13 +285,16 @@ def aprender_cor(exemplos):
     hsvs = [visao.hsv_monstro(img, desloc) for img, _ in exemplos]
     regs, info = [], []
     for hsv, (_, pos) in zip(hsvs, exemplos):
-        r, i = _regiao_semente(hsv, pos, m3)
+        r, i = _regiao_semente(hsv, pos, m3, m3_area)
         if r is not None:
             regs.append(r)
             info.append(i)
     if not regs:
         return None
-    px = np.concatenate(regs)
+    # cada exemplo pesa igual nos percentis (uma região grande não manda sozinha na caixa)
+    sorteio = np.random.default_rng(0)
+    px = np.concatenate([r if len(r) <= AMOSTRA_REGIAO else r[sorteio.choice(len(r), AMOSTRA_REGIAO, replace=False)]
+                         for r in regs])
     lo = np.clip(np.floor(np.percentile(px, 2, axis=0) - MARGEM_CAIXA), 0, 255).astype(int)
     hi = np.clip(np.ceil(np.percentile(px, 98, axis=0) + MARGEM_CAIXA), 0, 255).astype(int)
     hi[0] = min(hi[0], 179)
@@ -281,7 +313,7 @@ def aprender_cor(exemplos):
     areas, caixas = _areas(exemplos, (lo, hi), desloc)
     a_comp = float(np.median(areas)) if areas else a_reg
     # a componente da máscara pode vazar para o que encosta no monstro: limita pela região
-    a = min(a_comp, max(a_reg, 1.0) * 1.5)
+    a = max(min(a_comp, max(a_reg, 1.0) * 1.5), AREA_REF_MIN)
     caixa = tuple(int(v) for v in np.median(caixas, axis=0)) if caixas else (40, 40)
     return {"cor": (lo, hi), "area": (int(a * FATOR_AREA[0]), int(a * FATOR_AREA[1])),
             "area_ref": a, "caixa_ref": caixa, "vazamento": round(vz, 5), "usados": len(regs),
@@ -335,9 +367,11 @@ def salvar_perfil(nome, perfil, molde, exemplos=(), faixas=(), pasta=None):
     pasta = pasta or visao.PASTA_PERFIS
     os.makedirs(pasta, exist_ok=True)
     perfil = dict(perfil, texto=dict(perfil["texto"], molde=f"{nome}_texto.png"))
+    pasta_ex = os.path.join(pasta, f"{nome}_exemplos")
+    if os.path.isdir(pasta_ex):  # ensino refeito com o mesmo nome: nada do anterior fica
+        shutil.rmtree(pasta_ex)
     cv2.imwrite(os.path.join(pasta, f"{nome}_texto.png"), molde)
     if exemplos:
-        pasta_ex = os.path.join(pasta, f"{nome}_exemplos")
         os.makedirs(pasta_ex, exist_ok=True)
         lista = []
         for i, (img, pos) in enumerate(exemplos, 1):

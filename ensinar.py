@@ -7,12 +7,12 @@ Uso:  python ensinar.py <nome>          (ex.: python ensinar.py ogro)
   3. Confira perfis/<nome>_conferir.png: círculo verde = o que o bot acha que é o monstro,
      x vermelho = onde você ensinou. Se algum monstro ficou sem círculo (ex.: outro tom de
      pele), ponha o mouse nele e aperte F9 de novo. 2 a 4 exemplos costumam bastar.
+     F7 desfaz o último exemplo (se o círculo verde apareceu no chão, por exemplo).
   4. F10 grava perfis/<nome>.json. Depois: python main.py --monstro <nome>
   Ctrl+C no terminal sai sem gravar. (Se o F9/F10 trocar a aba do painel no jogo, volte
   para a mochila antes de ligar o bot: ele lê os ossos no inventário.)
 
 Opções:
-  --qualquer-nivel   aceita o monstro em qualquer nível (o molde para no nome)
   --espera-loot S    tempo máximo esperando o loot depois da morte (padrão 4,5 s)
   --nome-jogo "X"    nome mostrado nas mensagens (padrão: <nome>)
   --sem-osso         o monstro não larga "Big bones" (o único osso que o bot conhece):
@@ -40,7 +40,6 @@ import visao
 def _args():
     p = argparse.ArgumentParser(description="Ensina um monstro novo ao bot.")
     p.add_argument("nome", help="nome do perfil (letras minúsculas, números, _ ou -)")
-    p.add_argument("--qualquer-nivel", action="store_true")
     p.add_argument("--espera-loot", type=float, default=4.5)
     p.add_argument("--nome-jogo", default=None)
     p.add_argument("--sem-osso", action="store_true")
@@ -60,9 +59,9 @@ def _args():
 class Ensino:
     """Junta exemplos (quadro, ponto) e o molde do texto; reaprende a cada exemplo."""
 
-    def __init__(self, nome, nome_jogo, com_nivel, espera_loot, osso="Big bones"):
+    def __init__(self, nome, nome_jogo, espera_loot, osso="Big bones"):
         self.nome, self.nome_jogo = nome, nome_jogo
-        self.com_nivel, self.espera_loot, self.osso = com_nivel, espera_loot, osso
+        self.espera_loot, self.osso = espera_loot, osso
         self.molde = None
         self.exemplos = []
         self.faixas = []
@@ -72,8 +71,11 @@ class Ensino:
         """Novo exemplo. Devolve uma mensagem para o usuário."""
         if not visao.dentro_do_jogo(pos) or visao.na_interface(pos):
             return "exemplo recusado: o mouse está fora da área do jogo (ponha-o em cima do monstro)"
-        molde, motivo = ensino.gerar_molde_texto(faixa, com_nivel=self.com_nivel)
+        molde, motivo = ensino.gerar_molde_texto(faixa)
         if molde is None:
+            return f"exemplo recusado: {motivo}"
+        motivo = ensino.checar_exemplo(img, pos)
+        if motivo is not None:
             return f"exemplo recusado: {motivo}"
         if self.molde is None:
             self.molde = molde
@@ -95,6 +97,20 @@ class Ensino:
                                           for _, p in self.exemplos[:-1]) <= 25:
             aviso = " (mesmo lugar de um exemplo anterior: ensine OUTROS monstros, de preferência os que ficaram sem círculo)"
         return self.resumo() + aviso
+
+    def desfazer(self):
+        """Tira o último exemplo e reaprende com os que sobraram."""
+        if not self.exemplos:
+            return "nada para desfazer"
+        self.exemplos.pop()
+        if len(self.faixas) > len(self.exemplos):
+            self.faixas.pop()
+        if not self.exemplos:
+            self.molde, self.perfil, self.faixas = None, None, []
+            return "exemplo desfeito: nenhum exemplo agora"
+        self.perfil = ensino.montar_perfil(self.nome_jogo, self.molde, self.exemplos, self.espera_loot,
+                                           osso=self.osso)
+        return "exemplo desfeito; " + self.resumo()
 
     def perfil_visao(self):
         """O perfil no formato de visao.PERFIS, para detectar com ele."""
@@ -156,7 +172,7 @@ def ao_vivo(e):
     import tela
 
     print(__doc__.split("Opções:")[0])
-    print("Aguardando F9 (exemplo) ou F10 (gravar); Ctrl+C sai sem gravar...")
+    print("Aguardando F9 (exemplo), F7 (desfaz o último) ou F10 (gravar); Ctrl+C sai sem gravar...")
 
     def solta(tecla):
         while keyboard.is_pressed(tecla):
@@ -164,6 +180,12 @@ def ao_vivo(e):
 
     while True:
         time.sleep(0.02)
+        if keyboard.is_pressed("F7"):
+            solta("F7")
+            print(e.desfazer())
+            if e.perfil is not None:
+                print(f"Confira: {e.conferir()}")
+            continue
         if keyboard.is_pressed("F10"):
             solta("F10")
             if e.perfil is None:
@@ -183,7 +205,10 @@ def ao_vivo(e):
             print(f"Exemplo recusado: {problema}")
             continue
         pos = (mx - tela.REGIAO["left"], my - tela.REGIAO["top"])
-        msg = e.adicionar(img, pos, visao.recortar(img, visao.FAIXA_TEXTO_ACAO))
+        try:
+            msg = e.adicionar(img, pos, visao.recortar(img, visao.FAIXA_TEXTO_ACAO))
+        except Exception as erro:  # um exemplo ruim não pode derrubar o ensino inteiro
+            msg = f"exemplo recusado: erro ao aprender ({erro!r})"
         print(msg)
         if e.perfil is not None and not msg.startswith("exemplo recusado"):
             print(f"Confira: {e.conferir()}")
@@ -191,7 +216,7 @@ def ao_vivo(e):
 
 def principal():
     a = _args()
-    e = Ensino(a.nome, a.nome_jogo or a.nome, not a.qualquer_nivel, a.espera_loot,
+    e = Ensino(a.nome, a.nome_jogo or a.nome, a.espera_loot,
                osso=None if a.sem_osso else "Big bones")
     if a.de_amostras:
         de_amostras(e, a.de_amostras, a.faixa, a.max)

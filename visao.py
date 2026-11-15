@@ -122,38 +122,43 @@ def perfis_disponiveis():
 
 def carregar_perfil(nome):
     """Perfil pelo nome: os embutidos (PERFIS) não mudam; senão lê perfis/<nome>.json, gerado
-    por ensinar.py, e registra o molde do texto de ação dele. KeyError se não existir."""
+    por ensinar.py, e registra o molde do texto de ação dele. KeyError se não existir;
+    ValueError (com o motivo) se o arquivo estiver incompleto ou estragado."""
     if nome in PERFIS:
         return PERFIS[nome]
     caminho = os.path.join(PASTA_PERFIS, f"{nome}.json")
     if not os.path.isfile(caminho):
         raise KeyError(nome)
-    with open(caminho, encoding="utf-8") as f:
-        d = json.load(f)
-    chave = f"perfil_{nome}"
-    molde = cv2.imread(os.path.join(PASTA_PERFIS, d["texto"]["molde"]), cv2.IMREAD_GRAYSCALE)
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            d = json.load(f)
+        molde_arq = os.path.join(PASTA_PERFIS, d["texto"]["molde"])
+        perfil = {
+            "nome": d["nome"],
+            "texto": f"perfil_{nome}",
+            "cor": (np.array(d["cor"][0]), np.array(d["cor"][1])),
+            "area": tuple(d["area"]),
+            "fechar": int(d.get("fechar", 5)),
+            "barra": tuple(d["barra"]),
+            "raio_mira": int(d["raio_mira"]),
+            "area_mira": int(d["area_mira"]),
+            "espera_loot": float(d.get("espera_loot", 4.5)),
+            "loot_menu": bool(d.get("loot_menu", True)),
+            # o bot só conhece "Big bones"; com osso nulo ele não pega nem enterra ossos e
+            # espera o loot por qualquer rótulo novo no chão (main.esperar_loot_rotulo)
+            "osso": d.get("osso", "Big bones") is not None,
+            "desloc_matiz": int(d.get("desloc_matiz", 0)),
+            "aprendido": True,
+        }
+        limiar = float(d["texto"].get("limiar", 0.95))
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as erro:
+        raise ValueError(f"{caminho}: campo faltando ou inválido ({erro!r}); refaça com ensinar.py") from erro
+    molde = cv2.imread(molde_arq, cv2.IMREAD_GRAYSCALE)
     if molde is None:
-        raise FileNotFoundError(os.path.join(PASTA_PERFIS, d["texto"]["molde"]))
-    TEXTOS[chave] = molde
-    MASCARA_TEXTO_CHAVE[chave] = mascara_texto_geral
-    LIMIAR_TEXTO_CHAVE[chave] = float(d["texto"].get("limiar", 0.95))
-    perfil = {
-        "nome": d["nome"],
-        "texto": chave,
-        "cor": (np.array(d["cor"][0]), np.array(d["cor"][1])),
-        "area": tuple(d["area"]),
-        "fechar": int(d.get("fechar", 5)),
-        "barra": tuple(d["barra"]),
-        "raio_mira": int(d["raio_mira"]),
-        "area_mira": int(d["area_mira"]),
-        "espera_loot": float(d.get("espera_loot", 4.5)),
-        "loot_menu": bool(d.get("loot_menu", True)),
-        # o bot só conhece "Big bones"; com osso nulo ele não pega nem enterra ossos e
-        # espera o loot por qualquer rótulo novo no chão (main.esperar_loot_rotulo)
-        "osso": d.get("osso", "Big bones") is not None,
-        "desloc_matiz": int(d.get("desloc_matiz", 0)),
-        "aprendido": True,
-    }
+        raise ValueError(f"molde do texto não encontrado: {molde_arq}")
+    TEXTOS[perfil["texto"]] = molde
+    MASCARA_TEXTO_CHAVE[perfil["texto"]] = mascara_texto_geral
+    LIMIAR_TEXTO_CHAVE[perfil["texto"]] = limiar
     PERFIS[nome] = perfil
     return perfil
 
