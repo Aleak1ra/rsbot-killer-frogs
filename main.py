@@ -1081,8 +1081,9 @@ def loop_principal():
         # conferido como o do começo do ciclo (visto: 2 hovers falhos com quadro de 1,0-1,3 s)
         if _mira["perdida"]:
             _mira["perdida"] = False
-            img = capturar()
             t0 = time.perf_counter()
+            img = capturar()
+            t1 = time.perf_counter()
             desalinhado = visao.diferenca_caixa_vida(img) > visao.CAIXA_VIDA_LIMIAR
             if desalinhado or visao.estado_combate(img) == "lutando":
                 continue
