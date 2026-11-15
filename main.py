@@ -113,6 +113,7 @@ PROCURA_TAKE = [(0, 22), (12, 0), (-12, 0), (0, 10), (12, 22), (-12, 22), (24, 0
 # acima da pilha, até ~8 linhas de 22 px) e tolerância entre duas leituras seguidas
 MIRA_RAIO_X, MIRA_ACIMA, MIRA_ABAIXO = 260, 230, 90
 MIRA_PARADO_PX = 3
+MIRA_LONGA = (1.5, 80)  # s, px: até isso depois de uma coleta mais longe que isso, mira com 2 leituras
 MIRA_TIMEOUT = 1.0
 COLETA_MAX_FOTOS = 40  # fotos de falha por sessão (logs/coleta_falhas/)
 
@@ -466,6 +467,7 @@ def salvar_menu(rec, ok, item="osso"):
 _ultimo_menu = {"rec": None, "regiao": None}  # o último menu lido (para a foto de falha)
 # a tela não parou a tempo (mirar_parado): o quadro do ciclo ficou velho (~1 s) para o ataque
 _mira = {"perdida": False}
+_ultima_coleta = {"t": 0.0, "dist": 0.0}  # a última coleta confirmada (mirar_parado)
 
 
 def pegar_pelo_menu(pos, achar=visao.achar_take_no_menu, item="osso"):
@@ -550,7 +552,10 @@ def mirar_parado(pos, detectar_local):
     x, y = int(pos[0]), int(pos[1])
     regiao = (max(x - MIRA_RAIO_X, 0), max(y - MIRA_ACIMA, 0),
               min(x + MIRA_RAIO_X, CAPTURE_REGION["width"]), min(y + MIRA_ABAIXO, CAPTURE_REGION["height"]))
-    atual, anterior = pos, pos
+    # logo depois de uma coleta longa a câmera ainda desliza devagar e a comparação com o quadro
+    # do ciclo aceitava cedo demais (10,7% de menus falhos, contra 2,6% exigindo 2 leituras)
+    longa = time.time() - _ultima_coleta["t"] < MIRA_LONGA[0] and _ultima_coleta["dist"] > MIRA_LONGA[1]
+    atual, anterior = pos, (None if longa else pos)
     inicio = time.perf_counter()
     while time.perf_counter() - inicio < MIRA_TIMEOUT:
         candidatos = detectar_local(capturar(regiao), regiao[:2])
@@ -623,6 +628,7 @@ def pegar_osso(img, ossos):
                pos=[int(pos[0]), int(pos[1])])
         if ok:
             ENTERRO.pegos_desde += 1
+            _ultima_coleta.update(t=time.time(), dist=dist)
         return True
     return False
 
@@ -764,6 +770,7 @@ class ColetaChao:
             self.total += 1
             self.recem_ate = time.time() + COLETA_RECEM_PEGO[0]
             self.recem_pos = pos
+            _ultima_coleta.update(t=time.time(), dist=dist)
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
             if dt < INVENTARIO_RAPIDA:  # diagnóstico: o que mudou no inventário tão rápido?
                 self._foto_inventario(inv_antes, leitura["inv"])
