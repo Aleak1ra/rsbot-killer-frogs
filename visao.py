@@ -221,6 +221,9 @@ def casar_rotulo(mask, tpl):
     res = np.zeros((rh, rw), np.float32)
     precisa = cv2.dilate((mask > 0).astype(np.uint8), np.ones((th, tw), np.uint8), anchor=(0, 0),
                          borderType=cv2.BORDER_CONSTANT, borderValue=0)[:rh, :rw]
+    if cv2.countNonZero(precisa) > 0.4 * rh * rw:
+        # cena clara (muito branco espalhado, ex.: neve): por pedaços sairia mais lento
+        return cv2.matchTemplate(mask, tpl, cv2.TM_CCOEFF_NORMED)
     _, _, caixas, _ = cv2.connectedComponentsWithStats(precisa, connectivity=8)
     for x, y, w, h, _ in caixas[1:]:
         res[y:y + h, x:x + w] = cv2.matchTemplate(mask[y:y + h + th - 1, x:x + w + tw - 1], tpl,
