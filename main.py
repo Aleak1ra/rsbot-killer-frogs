@@ -12,6 +12,7 @@ Cada sessão grava um log de eventos em logs/sessao_*.jsonl; use
 """
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -114,6 +115,10 @@ INTERVALO_ENTERRAR = 1.3  # o jogo ignora cliques de enterrar mais rápidos que 
 MIN_OSSOS_ENTERRAR = 10  # fora de combate só enterra se acumular isso
 # Onde o mouse descansa depois de clicar no inventário (coluna de pedra, sem tooltip)
 PONTO_NEUTRO = (1593, 960)
+# O jogo desconecta depois de 5 min sem mouse/teclado (visto às 03:32 de 15/11, numa pausa
+# por vida baixa). Parado (pausa por vida), o bot mexe o mouse na coluna de pedra e toca o
+# Shift a cada intervalo sorteado entre esses valores (s), sem clicar em nada.
+ANTI_AFK_SEG = (60.0, 120.0)
 
 pyautogui.PAUSE = 0.03
 
@@ -125,6 +130,8 @@ ossos_ativos = threading.Event()
 ossos_ativos.set()
 mouse_parado_desde = time.time()
 pos_anterior = pyautogui.position()
+ultima_entrada = time.time()  # último movimento/clique/tecla (do bot ou do usuário)
+anti_afk_intervalo = random.uniform(*ANTI_AFK_SEG)
 
 # Janela do jogo: a captura acompanha a área do jogo onde quer que a janela esteja
 # (tela.atualizar_janela, chamado a cada ciclo). É o mesmo dicionário de tela.REGIAO.
@@ -216,10 +223,10 @@ jogo_em_foco = tela.jogo_em_foco  # segue a janela ativa do jogo (ver tela.py)
 
 
 def tempo_mouse_parado():
-    global mouse_parado_desde, pos_anterior
+    global mouse_parado_desde, pos_anterior, ultima_entrada
     atual = pyautogui.position()
     if np.linalg.norm(np.subtract(atual, pos_anterior)) > 2:
-        mouse_parado_desde = time.time()
+        mouse_parado_desde = ultima_entrada = time.time()
         pos_anterior = atual
     return time.time() - mouse_parado_desde >= TEMPO_MOUSE_PARADO
 
@@ -230,7 +237,7 @@ def mover(pos):
     Nunca sai da área do jogo: um ponto fora dela (na moldura ou na barra de tarefas do
     Windows) é trazido para a borda de dentro e registrado no log.
     """
-    global pos_anterior
+    global pos_anterior, ultima_entrada
     x, y = int(pos[0]), int(pos[1])
     if not visao.dentro_do_jogo((x, y)):
         cx, cy, cw, ch = visao.CLIENTE_CALIBRADO
@@ -241,12 +248,32 @@ def mover(pos):
         x, y = x2, y2
     pyautogui.moveTo(CAPTURE_REGION["left"] + x, CAPTURE_REGION["top"] + y)
     pos_anterior = pyautogui.position()
+    ultima_entrada = time.time()
 
 
 def clicar():
-    global pos_anterior
+    global pos_anterior, ultima_entrada
     pyautogui.click()
     pos_anterior = pyautogui.position()
+    ultima_entrada = time.time()
+
+
+def manter_conectado():
+    """Parado (pausa por vida baixa), evita a desconexão por inatividade: depois de um
+    intervalo sem nenhuma entrada, mexe o mouse na coluna de pedra do inventário e toca o
+    Shift. Não clica em nada. Só deve ser chamada com o jogo em foco e na tela de jogo."""
+    global anti_afk_intervalo, ultima_entrada
+    if time.time() - ultima_entrada < anti_afk_intervalo:
+        return False
+    x, y = PONTO_NEUTRO
+    mover((x + random.randint(-3, 3), y + random.randint(-20, 20)))
+    time.sleep(random.uniform(0.08, 0.2))
+    mover(PONTO_NEUTRO)
+    pyautogui.press("shift")
+    ultima_entrada = time.time()
+    anti_afk_intervalo = random.uniform(*ANTI_AFK_SEG)
+    LOG.ev("anti_afk")
+    return True
 
 
 def clicar_conferindo(pos, classe):
@@ -890,6 +917,8 @@ def loop_principal():
                 print(f"\n⚠️ Não consigo ler o orbe de vida há {agora - sem_leitura_desde:.0f} s "
                       f"(ele está visível, sem nada por cima?). {consequencia}")
         if vigia_vida.pausado:
+            if alinhado:  # tela de jogo (não a de login): mantém a conexão enquanto espera
+                manter_conectado()
             time.sleep(0.5)
             continue
         if not alinhado:
