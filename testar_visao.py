@@ -523,6 +523,23 @@ def testar_menu_tem_take():
     return falhas
 
 
+def testar_take_acao():
+    """visao.tem_take_acao nas faixas do texto de ação: "Take <qualquer item>" sim; "Attack
+    ..." e "Walk here" não. É o que guia a procura do item com o mouse (main.procurar_take)."""
+    falhas, n = [], 0
+    for caminho in sorted(glob.glob(os.path.join(PASTA, "faixas", "*.png"))):
+        nome = os.path.basename(caminho)
+        classe = nome.split("_")[1]
+        if classe == "take-rej":
+            continue  # "Take" de outro item por cima ou nada: não se sabe qual
+        n += 1
+        tem = visao.tem_take_acao(cv2.imread(caminho))
+        if tem != (classe == "take-ok"):
+            falhas.append(f"faixas/{nome}: tem_take_acao = {tem}")
+    print(f"Take no texto de ação: {n} faixas")
+    return falhas
+
+
 def testar_runas_chao():
     return testar_item_chao("runa")
 
@@ -568,7 +585,7 @@ if __name__ == "__main__":
     falhas += testar_vigia_vida() + testar_geometria()
     for item in visao.ITENS_CHAO:
         falhas += testar_item_chao(item) + testar_item_menu(item)
-    falhas += testar_rotulo_vizinho() + testar_menu_tem_take()
+    falhas += testar_rotulo_vizinho() + testar_menu_tem_take() + testar_take_acao()
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:

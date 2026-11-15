@@ -166,6 +166,19 @@ def faixa_texto(img):
     return recortar(img, FAIXA_TEXTO_ACAO)
 
 
+# Só a palavra "Take" do texto de ação (do molde "Take Big bones"): diz se há um item do
+# chão sob o cursor, qualquer que seja. Medido nas 353 faixas salvas: "Take ..." >= 0,998;
+# "Attack ..." e "Walk here" <= 0,70.
+TAKE_ACAO = TEXTOS["take"][:, 1:41].copy()
+TAKE_ACAO_THRESHOLD = 0.9
+
+
+def tem_take_acao(faixa):
+    """O texto de ação (recorte FAIXA_TEXTO_ACAO) começa com "Take"? (item sob o cursor)"""
+    return float(cv2.matchTemplate(mascara_texto(faixa), TAKE_ACAO, cv2.TM_CCOEFF_NORMED).max()) \
+        >= TAKE_ACAO_THRESHOLD
+
+
 # ---------- Menu de botão direito ----------
 # Medido em 20 menus: a linha "Take Big bones" dá >= 0,97; "Examine Big bones" <= 0,86.
 MENU_THRESHOLD = 0.91

@@ -84,9 +84,14 @@ COLETA_IGNORAR_SEG = 60.0  # pilha que falhou fica ignorada por esse tempo (as o
 COLETA_IGNORAR_RAIO = 25  # px em volta da pilha que falhou
 COLETA_FALHAS_PAUSA = 3  # falhas seguidas -> deixa aquele item de lado por COLETA_PAUSA s
 COLETA_PAUSA = 30.0
-COLETA_MENU_FECHAR = 0.2  # s depois do clique no menu antes de conferir (ele cobre rótulos)
-COLETA_CAMINHO_MARGEM = 50  # px em volta do retângulo personagem-pilha onde se conta o alvo
+# Conferência da coleta pelo inventário: px que mudaram de tom (> INVENTARIO_DIF_TOM em
+# algum canal) para contar como mudança (o número de uma pilha trocando já dá dezenas)
+INVENTARIO_DIF_TOM = 40
+INVENTARIO_DIF_PX = 20  # medido: entre quadros sem mudança, no máximo ~11 px variam
 COLETA_SOB_PERSONAGEM = 90  # px do centro: depois de andar até a pilha, ela fica aqui
+# Onde procurar o item (texto de ação "Take") quando o clique caiu fora dele: primeiro uma
+# linha de rótulo abaixo, depois em volta
+PROCURA_TAKE = [(0, 22), (12, 0), (-12, 0), (0, 10), (12, 22), (-12, 22), (24, 0), (-24, 0), (0, -10)]
 # Mira com a tela parada (mirar_parado): região relida em volta do alvo (os rótulos ficam
 # acima da pilha, até ~8 linhas de 22 px) e tolerância entre duas leituras seguidas
 MIRA_RAIO_X, MIRA_ACIMA, MIRA_ABAIXO = 260, 230, 90
@@ -411,23 +416,40 @@ def pegar_pelo_menu(pos, achar=visao.achar_take_no_menu, item="osso"):
     return True
 
 
-def pegar_pelo_menu_pilha(pos, achar=visao.achar_take_no_menu, item="osso"):
-    """pegar_pelo_menu na pilha; se o menu abriu sem nenhum "Take" (quadrado vazio), tenta
-    de novo uma linha de rótulo abaixo.
+def procurar_take(pos):
+    """Passa o mouse em volta de `pos` até o texto de ação mostrar "Take" (há um item sob o
+    cursor). Devolve o ponto achado ou None. O item só é clicável em cima do desenho dele,
+    que nem sempre fica no centro do rótulo (visto em jogo: 18 px ao lado numa pilha com
+    "Big bones x 2"), e a descida pela pilha às vezes para uma linha antes (22 px acima)."""
+    for dx, dy in PROCURA_TAKE:
+        ponto = (pos[0] + dx, pos[1] + dy)
+        if not visao.dentro_do_jogo(ponto):
+            continue
+        mover(ponto)
+        time.sleep(HOVER_ATRASO_MIN)
+        seguidas = [0]  # duas leituras seguidas: o texto de antes pode ainda estar na tela
 
-    Visto em jogo: dois rótulos encavalados na pilha ("Limpwurt root" duas vezes) viram uma
-    linha embaralhada, a descida pela pilha para uma linha antes e o clique cai 22 px acima
-    do item, num quadrado vazio.
-    """
+        def tem_take():
+            seguidas[0] = seguidas[0] + 1 if visao.tem_take_acao(capturar(visao.FAIXA_TEXTO_ACAO)) else 0
+            return seguidas[0] >= 2
+
+        ok, _ = esperar(tem_take, HOVER_TIMEOUT, 0.03)
+        if ok:
+            return ponto
+    return None
+
+
+def pegar_pelo_menu_pilha(pos, achar=visao.achar_take_no_menu, item="osso"):
+    """pegar_pelo_menu na pilha; se o menu abriu sem nenhum "Take" (o clique caiu fora do
+    item), procura com o mouse um ponto em volta onde o jogo mostre "Take" e tenta ali."""
     if pegar_pelo_menu(pos, achar, item):
         return True
-    abaixo = (pos[0], pos[1] + visao.ROTULO_ENTRE_LINHAS)
-    if visao.menu_tem_take(_ultimo_menu["rec"]) or not visao.dentro_do_jogo(abaixo):
-        return False
-    LOG.ev("menu_abaixo", item=item, pos=[int(abaixo[0]), int(abaixo[1])])
-    mover(abaixo)
-    time.sleep(0.05)
-    return pegar_pelo_menu(abaixo, achar, item)
+    if visao.menu_tem_take(_ultimo_menu["rec"]):
+        return False  # a pilha estava certa, só não tinha o item
+    ponto = procurar_take(pos)
+    LOG.ev("menu_procura", item=item, achou=ponto is not None,
+           desloc=None if ponto is None else [int(ponto[0] - pos[0]), int(ponto[1] - pos[1])])
+    return ponto is not None and pegar_pelo_menu(ponto, achar, item)
 
 
 def mirar_parado(pos, detectar_local):
@@ -524,20 +546,6 @@ class ColetaChao:
         return [i for i in itens if distancia(CENTRO, i["pos"]) <= raio
                 and not any(distancia(i["pos"], p) <= COLETA_IGNORAR_RAIO for p, _ in self.ignoradas)]
 
-    def contar(self, img, alvo):
-        """Rótulos do item no caminho até a pilha-alvo, para conferir a coleta.
-
-        O personagem anda na diagonal e depois reto; a pilha (e tudo o mais na tela) se
-        desloca dentro do retângulo entre ela e o centro da tela. Só os rótulos ali contam:
-        contar a tela inteira deixava um rótulo de outro jogador surgindo na borda esconder
-        a coleta (falha falsa). Sem filtro de distância nem de pilhas ignoradas.
-        """
-        m = COLETA_CAMINHO_MARGEM
-        x1, x2 = sorted((CENTRO[0], alvo[0]))
-        y1, y2 = sorted((CENTRO[1], alvo[1]))
-        return sum(1 for i in visao.detectar_itens_chao(img, self.item)
-                   if x1 - m <= i["pos"][0] <= x2 + m and y1 - m <= i["pos"][1] <= y2 + m)
-
     def _foto_falha(self, img, alvo, motivo, depois=None):
         """Quadro com o alvo marcado, o menu lido e o quadro do fim da espera (se houver),
         para descobrir depois por que falhou."""
@@ -583,11 +591,13 @@ class ColetaChao:
             LOG.ev("mira_perdida", item=self.item)
             return False
         if distancia(pos, alvo["pos"]) > MIRA_PARADO_PX:
-            img = capturar()  # a tela andou: a contagem de antes tem que ser do quadro novo
             alvo = dict(alvo, pos=pos)
         dist = distancia(CENTRO, pos)
-        antes = self.contar(img, pos)
         evento = f"pegar_{self.item}"
+        # Inventário de referência: um osso enterrado há pouco ainda pode sumir dele
+        while time.time() - ENTERRO.ultimo < INTERVALO_ENTERRAR:
+            time.sleep(0.05)
+        inv_antes = capturar(visao.INVENTARIO)
         mover(pos)
         time.sleep(0.05)
         achar = lambda rec: visao.achar_take_item_no_menu(rec, self.item)  # noqa: E731
@@ -598,37 +608,30 @@ class ColetaChao:
             return False
         salvar_amostra(f"{self.item}_ok", img, pos, score=alvo["score"])
 
-        # Pegou quando um rótulo desse item some do caminho até a pilha (andando, os
-        # rótulos só se mexem). Logo após o clique o menu ainda está na tela e pode cobrir
-        # rótulos: espera ele fechar e exige duas leituras seguidas.
-        time.sleep(COLETA_MENU_FECHAR)
+        # Pegou quando o inventário muda: runa e moedas empilham, então aparece a pilha nova
+        # ou muda o número dela. Contar rótulos na tela dava falha falsa em caminhadas
+        # longas (a tela desliza e outra pilha do item entra no caminho). Duas leituras
+        # seguidas, para um redesenho isolado não contar.
         seguidas = [0]
-        ultimo = [None]
-        maximo = [antes]
 
-        def sumiu():
-            ultimo[0] = capturar()
-            n = self.contar(ultimo[0], pos)
-            maximo[0] = max(maximo[0], n)
-            seguidas[0] = seguidas[0] + 1 if n < antes else 0
+        def mudou():
+            dif = cv2.absdiff(capturar(visao.INVENTARIO), inv_antes).max(axis=2) > INVENTARIO_DIF_TOM
+            seguidas[0] = seguidas[0] + 1 if int(dif.sum()) >= INVENTARIO_DIF_PX else 0
             return seguidas[0] >= 2
 
-        ok, dt = esperar(sumiu, ESPERA_PEGAR_ITEM + dist / 150, 0.1)
-        # Outra pilha do mesmo item entrou no caminho durante a caminhada: a contagem não
-        # diz nada. Não conta como falha nem ignora a pilha.
-        inconclusivo = not ok and maximo[0] > antes
-        LOG.ev(evento, ok=None if inconclusivo else ok, lat=round(dt + COLETA_MENU_FECHAR, 3),
-               dist=round(dist), score=alvo["score"], pos=list(pos))
+        ok, dt = esperar(mudou, ESPERA_PEGAR_ITEM + dist / 150, 0.1)
+        LOG.ev(evento, ok=ok, lat=round(dt, 3), dist=round(dist), score=alvo["score"], pos=list(pos))
         if ok:
             self.falhas = 0
             self.total += 1
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
-        elif not inconclusivo:
+        else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
-            perto = [i["pos"] for i in visao.detectar_itens_chao(ultimo[0], self.item)
-                     if distancia(i["pos"], CENTRO) <= COLETA_SOB_PERSONAGEM] if ultimo[0] is not None else []
+            depois = capturar()
+            perto = [i["pos"] for i in visao.detectar_itens_chao(depois, self.item)
+                     if distancia(i["pos"], CENTRO) <= COLETA_SOB_PERSONAGEM]
             onde = min(perto, key=lambda p: distancia(p, CENTRO)) if perto else None
-            self._falhou(img, alvo, "nao_sumiu", depois=ultimo[0], ignorar=onde)
+            self._falhou(img, alvo, "inventario_igual", depois=depois, ignorar=onde)
         return True
 
 
