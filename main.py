@@ -529,13 +529,15 @@ def mirar_parado(pos, detectar_local):
 
     Visto em jogo: logo depois de pegar um osso o personagem ainda anda, a câmera o segue
     e a tela desliza; o clique feito pelo quadro do início do ciclo caía ~65 px fora da
-    pilha. Relê a região do alvo até duas leituras seguidas concordarem (±3 px).
+    pilha. Relê a região do alvo até duas leituras seguidas concordarem (±3 px). A 1ª leitura
+    é comparada com `pos` (do quadro do ciclo, ~0,2 s antes): com a tela parada já confere e
+    poupa uma leitura (~55 ms por coleta; 80% das coletas); se não conferir, segue como antes.
     `detectar_local(recorte, origem)` devolve as posições candidatas (coordenadas da janela).
     """
     x, y = int(pos[0]), int(pos[1])
     regiao = (max(x - MIRA_RAIO_X, 0), max(y - MIRA_ACIMA, 0),
               min(x + MIRA_RAIO_X, CAPTURE_REGION["width"]), min(y + MIRA_ABAIXO, CAPTURE_REGION["height"]))
-    atual, anterior = pos, None
+    atual, anterior = pos, pos
     inicio = time.perf_counter()
     while time.perf_counter() - inicio < MIRA_TIMEOUT:
         candidatos = detectar_local(capturar(regiao), regiao[:2])
@@ -604,7 +606,8 @@ def pegar_osso(img, ossos):
         salvar_amostra("osso_ok", img, pos, score=osso["score"])
         ok, dt = esperar(lambda: len(contar_ossos_inventario()) > antes,
                          ESPERA_PEGAR_OSSO + dist / 150)
-        LOG.ev("pegar_osso", ok=ok, lat=round(dt, 3), dist=round(dist), clique=clique, via=via)
+        LOG.ev("pegar_osso", ok=ok, lat=round(dt, 3), dist=round(dist), clique=clique, via=via,
+               pos=[int(pos[0]), int(pos[1])])
         if ok:
             ENTERRO.pegos_desde += 1
         return True
