@@ -99,6 +99,7 @@ VAZAMENTO_FATOR = 4.0  # mancha maior que isso x a área do monstro conta como v
 MARGEM_CAIXA = (1, 6, 10)  # folga H, S, V em volta dos percentis 2-98 da região
 FECHAR = 5
 FATOR_AREA = (0.25, 4.0)
+MATIZ_BORDA = 10  # cor a até isso da volta 0/179 do matiz (vermelhos): aprende com o matiz girado
 
 
 def mascara_3d(shape):
@@ -125,13 +126,34 @@ def _comp_no_ponto(mask, pos, raio=12):
     return lab == k, st[k]
 
 
-def _mascara(img, cor, fechar):
-    return visao.mascara_monstro(img, {"cor": cor, "fechar": fechar})
+def _mascara(img, cor, fechar, desloc=0):
+    return visao.mascara_monstro(img, {"cor": cor, "fechar": fechar, "desloc_matiz": desloc})
 
 
-def _regiao_semente(img, pos, m3):
+def _desloc_matiz(exemplos):
+    """Giro do matiz para aprender monstros vermelhos: o matiz do OpenCV dá a volta em 0/179, e
+    uma caixa HSV não atravessa essa borda. Se a cor dos exemplos estiver a até MATIZ_BORDA
+    da volta, aprende (e detecta) com o matiz girado para pôr essa cor no meio da escala."""
+    angulos = []
+    yy, xx = np.ogrid[-R_MIOLO:R_MIOLO + 1, -R_MIOLO:R_MIOLO + 1]
+    disco = (xx * xx + yy * yy) <= R_MIOLO * R_MIOLO
+    for img, (x, y) in exemplos:
+        miolo = img[y - R_MIOLO:y + R_MIOLO + 1, x - R_MIOLO:x + R_MIOLO + 1]
+        if miolo.shape[:2] != disco.shape:
+            continue
+        h = cv2.cvtColor(miolo, cv2.COLOR_BGR2HSV)[..., 0][disco].astype(float)
+        angulos.append(h * np.pi / 90.0)
+    if not angulos:
+        return 0
+    a = np.concatenate(angulos)
+    h0 = (np.degrees(np.arctan2(np.sin(a).mean(), np.cos(a).mean())) / 2.0) % 180.0
+    if min(h0, 180.0 - h0) >= MATIZ_BORDA:
+        return 0
+    return int(round(90 - h0)) % 180
+
+
+def _regiao_semente(hsv, pos, m3):
     """Pixels HSV da região de cor parecida ligada ao ponto, e (h0, s0, tamanho)."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     x, y = pos
     yy, xx = np.ogrid[-R_MIOLO:R_MIOLO + 1, -R_MIOLO:R_MIOLO + 1]
     disco = (xx * xx + yy * yy) <= R_MIOLO * R_MIOLO
@@ -209,10 +231,10 @@ def _apertar(hsvs, regs, lo, hi, a_ref, m3, m3_area, travar_matiz=False):
     return lo, hi, vz
 
 
-def _areas(exemplos, cor):
+def _areas(exemplos, cor, desloc=0):
     areas, caixas = [], []
     for img, pos in exemplos:
-        comp, st = _comp_no_ponto(_mascara(img, cor, FECHAR), pos)
+        comp, st = _comp_no_ponto(_mascara(img, cor, FECHAR, desloc), pos)
         if comp is not None:
             areas.append(int(st[4]))
             caixas.append((int(st[2]), int(st[3])))
@@ -230,9 +252,11 @@ def aprender_cor(exemplos):
         return None
     m3 = mascara_3d(exemplos[0][0].shape)
     m3_area = float((m3 > 0).sum())
+    desloc = _desloc_matiz(exemplos)
+    hsvs = [visao.hsv_monstro(img, desloc) for img, _ in exemplos]
     regs, info = [], []
-    for img, pos in exemplos:
-        r, i = _regiao_semente(img, pos, m3)
+    for hsv, (_, pos) in zip(hsvs, exemplos):
+        r, i = _regiao_semente(hsv, pos, m3)
         if r is not None:
             regs.append(r)
             info.append(i)
@@ -243,11 +267,10 @@ def aprender_cor(exemplos):
     hi = np.clip(np.ceil(np.percentile(px, 98, axis=0) + MARGEM_CAIXA), 0, 255).astype(int)
     hi[0] = min(hi[0], 179)
     a_reg = float(np.median([i[2] for i in info]))
-    hsvs = [cv2.cvtColor(img, cv2.COLOR_BGR2HSV) for img, _ in exemplos]
     regs = [r.astype(int) for r in regs]
 
     lo, hi, vz = _apertar(hsvs, regs, lo, hi, a_reg, m3, m3_area)
-    areas, _ = _areas(exemplos, (lo, hi))
+    areas, _ = _areas(exemplos, (lo, hi), desloc)
     a_comp = float(np.median(areas)) if areas else a_reg
     # folga de matiz em volta das cores-semente (tons do mesmo monstro que nenhum exemplo
     # mostrou), depois aperta só S e V
@@ -255,13 +278,14 @@ def aprender_cor(exemplos):
     lo[0] = max(0, min(lo[0], int(min(h0s)) - FOLGA_MATIZ))
     hi[0] = min(179, max(hi[0], int(max(h0s)) + FOLGA_MATIZ))
     lo, hi, vz = _apertar(hsvs, regs, lo, hi, a_comp, m3, m3_area, travar_matiz=True)
-    areas, caixas = _areas(exemplos, (lo, hi))
+    areas, caixas = _areas(exemplos, (lo, hi), desloc)
     a_comp = float(np.median(areas)) if areas else a_reg
     # a componente da máscara pode vazar para o que encosta no monstro: limita pela região
     a = min(a_comp, max(a_reg, 1.0) * 1.5)
     caixa = tuple(int(v) for v in np.median(caixas, axis=0)) if caixas else (40, 40)
     return {"cor": (lo, hi), "area": (int(a * FATOR_AREA[0]), int(a * FATOR_AREA[1])),
-            "area_ref": a, "caixa_ref": caixa, "vazamento": round(vz, 5), "usados": len(regs)}
+            "area_ref": a, "caixa_ref": caixa, "vazamento": round(vz, 5), "usados": len(regs),
+            "desloc_matiz": desloc}
 
 
 def deduzir_parametros(caixa_ref, area_ref):
@@ -295,6 +319,7 @@ def montar_perfil(nome_jogo, molde, exemplos, espera_loot=4.5, loot_menu=True, o
         "espera_loot": espera_loot,
         "loot_menu": loot_menu,
         "osso": osso,
+        "desloc_matiz": cor["desloc_matiz"],
         "texto": {"limiar": LIMIAR_TEXTO_APRENDIDO, "altura": int(molde.shape[0]), "largura": int(molde.shape[1])},
         "aprendido": {"exemplos": len(exemplos), "area_ref": round(cor["area_ref"], 1),
                       "caixa_ref": list(cor["caixa_ref"]), "vazamento": cor["vazamento"]},

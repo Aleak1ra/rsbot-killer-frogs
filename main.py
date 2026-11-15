@@ -70,6 +70,7 @@ SEM_VIDA = "--sem-vida" in sys.argv
 ESPERA_INICIO_COMBATE = 5.0  # medido em 120 ataques: 1,5 s típico, 4,25 s no pior caso
 ESPERA_LOOT = PERFIL["espera_loot"]  # tempo para o osso aparecer depois da barra zerar
 RAIO_LOOT = 320  # px em volta do personagem
+LOOT_ROTULO_MIN = 1.0  # s: perfil sem osso só aceita o loot depois disso (medido: cai em 1,8-3,1 s)
 
 # Itens do chão pegos antes dos ossos: runas e moedas (--sem-runas / --sem-moedas desligam)
 PEGAR_RUNAS = "--sem-runas" not in sys.argv
@@ -728,8 +729,16 @@ def esperar_loot_rotulo(inicio):
     branco novo de rótulo de item em volta do personagem, ou o tempo do perfil acabar."""
     area = area_loot()
     base = visao.mascara_rotulos(capturar(area))[0]
+    seguidas = [0]
+
+    def caiu():
+        # duas leituras seguidas, e nunca antes de LOOT_ROTULO_MIN da morte (o loot leva ~2-3 s)
+        novo = visao.rotulo_novo(base, visao.mascara_rotulos(capturar(area))[0])
+        seguidas[0] = seguidas[0] + 1 if novo else 0
+        return seguidas[0] >= 2 and time.perf_counter() - inicio >= LOOT_ROTULO_MIN
+
     restante = max(ESPERA_LOOT - (time.perf_counter() - inicio), 0.1)
-    ok, _ = esperar(lambda: visao.rotulo_novo(base, visao.mascara_rotulos(capturar(area))[0]), restante, 0.05)
+    ok, _ = esperar(caiu, restante, 0.05)
     LOG.ev("loot", ok=ok, lat=round(time.perf_counter() - inicio, 3), via="rotulo")
     return ok
 

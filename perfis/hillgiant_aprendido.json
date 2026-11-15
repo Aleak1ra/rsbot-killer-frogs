@@ -20,6 +20,7 @@
   "espera_loot": 4.5,
   "loot_menu": true,
   "osso": "Big bones",
+  "desloc_matiz": 0,
   "texto": {
     "limiar": 0.95,
     "altura": 24,

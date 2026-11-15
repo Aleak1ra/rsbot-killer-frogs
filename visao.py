@@ -151,14 +151,24 @@ def carregar_perfil(nome):
         # o bot só conhece "Big bones"; com osso nulo ele não pega nem enterra ossos e
         # espera o loot por qualquer rótulo novo no chão (main.esperar_loot_rotulo)
         "osso": d.get("osso", "Big bones") is not None,
+        "desloc_matiz": int(d.get("desloc_matiz", 0)),
         "aprendido": True,
     }
     PERFIS[nome] = perfil
     return perfil
 
 
-def mascara_monstro(img, perfil):
+def hsv_monstro(img, desloc_matiz=0):
+    """HSV do quadro; com desloc_matiz o matiz é girado (perfis aprendidos de monstros
+    vermelhos, cuja cor fica na volta 0/179 que uma caixa HSV não atravessa)."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    if desloc_matiz:
+        hsv[..., 0] = ((hsv[..., 0].astype(np.uint16) + desloc_matiz) % 180).astype(np.uint8)
+    return hsv
+
+
+def mascara_monstro(img, perfil):
+    hsv = hsv_monstro(img, perfil.get("desloc_matiz", 0))
     mask = cv2.inRange(hsv, perfil["cor"][0], perfil["cor"][1])
     if perfil["fechar"]:
         k = np.ones((perfil["fechar"], perfil["fechar"]), np.uint8)
@@ -582,20 +592,36 @@ ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0)}
 DENTRO_MARGEM = 6  # px da borda da área do jogo: clique mais perto que isso é recusado
 
 
+ROTULO_DESLOC_MAX = 6  # px: rótulo que se mexeu até isso entre as leituras não é novo
+
+
 def rotulo_novo(binm_antes, binm_agora, largura_min=ROTULO_LARGURA_MIN):
     """Apareceu uma linha de texto branco nova, do tamanho de um rótulo de item, entre as
     duas máscaras (mascara_rotulos(...)[0] do mesmo recorte, com a tela parada)?
 
     Para saber que o loot caiu sem conhecer o item. Pedaços pequenos (o número branco de
-    um hitsplat, ~10-25 px de largura) não contam: só linhas com >= `largura_min` px."""
-    novo = binm_agora & ~cv2.dilate(binm_antes.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    um hitsplat, ~10-25 px de largura) não contam: só linhas com >= `largura_min` px. Um
+    rótulo que já estava no chão e se mexeu 1-2 px também não: na mesma linha some quase
+    tanto texto quanto aparece (visto ao vivo e em 231124_0112 -> 231125_0113)."""
+    k3 = np.ones((3, 3), np.uint8)
+    novo = binm_agora & ~cv2.dilate(binm_antes.astype(np.uint8), k3).astype(bool)
     if novo.sum() < largura_min:
         return False
+    sumiu = binm_antes & ~cv2.dilate(binm_agora.astype(np.uint8), k3).astype(bool)
     # junta as letras de uma mesma linha (o espaço entre palavras é < 10 px)
     linhas = cv2.dilate(novo.astype(np.uint8), np.ones((3, ROTULO_ESPACO_MAX), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(linhas, connectivity=8)
-    return any(st[k, cv2.CC_STAT_WIDTH] >= largura_min and st[k, cv2.CC_STAT_HEIGHT] <= 24
-               for k in range(1, n))
+    for k in range(1, n):
+        x, y, w, h = st[k, :4]
+        if w < largura_min or h > 24:
+            continue
+        apareceu = int(novo[y:y + h, x:x + w].sum())
+        # o texto que sumiu de um rótulo que se mexeu fica a poucos px do que apareceu
+        y0, x0 = max(y - ROTULO_DESLOC_MAX, 0), max(x - ROTULO_DESLOC_MAX, 0)
+        sumido = int(sumiu[y0:y + h + ROTULO_DESLOC_MAX, x0:x + w + ROTULO_DESLOC_MAX].sum())
+        if sumido < 0.5 * apareceu:
+            return True
+    return False
 
 
 def dentro_do_jogo(pos, margem=DENTRO_MARGEM):

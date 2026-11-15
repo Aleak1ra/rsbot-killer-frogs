@@ -30,6 +30,8 @@ def testar_frames():
     caminho = os.path.join(PASTA, "rotulos.jsonl")
     if not os.path.exists(caminho):
         return []
+    for nome in visao.perfis_disponiveis():  # amostras gravadas com perfis aprendidos também
+        visao.carregar_perfil(nome)
     falhas, n = [], {"osso_ok": 0, **{f"{p}_ok": 0 for p in visao.PERFIS}}
     piores = {"osso_ok": 1.0}
     with open(caminho, encoding="utf-8") as f:
@@ -64,14 +66,16 @@ def testar_faixas():
     esperado = {"sapo-giant": "giant", "sapo-hillgiant": "hillgiant", "take-ok": "take",
                 "sapo-None": None, "take-rej": None}
     falhas, n = [], 0
-    margens = {c: [] for c in visao.TEXTOS}
+    # só os moldes embutidos: os aprendidos (perfil_*) são conferidos em testar_perfis_aprendidos
+    chaves = [c for c in visao.TEXTOS if not c.startswith("perfil_")]
+    margens = {c: [] for c in chaves}
     for caminho in sorted(glob.glob(os.path.join(PASTA, "faixas", "*.png"))):
         nome = os.path.basename(caminho)
         classe = nome.split("_")[1]
         if classe not in esperado:
             continue
         faixa = cv2.imread(caminho)
-        scores = {c: visao.score_texto(faixa, c) for c in visao.TEXTOS}
+        scores = {c: visao.score_texto(faixa, c) for c in chaves}
         lido = max(scores, key=scores.get)
         if scores[lido] < visao.TEXTO_THRESHOLD:
             lido = None
@@ -577,26 +581,97 @@ def testar_rotulo_novo():
             agora[600:612, 900:900 + largura] = True
             if visao.rotulo_novo(binm, agora):
                 falhas.append(f"runas/{arq}: borrão de {largura} px contou como rótulo novo")
+        # os rótulos do chão que se mexem um pouco (tela assentando) não são loot novo
+        for dx, dy in ((0, 1), (2, 0), (4, 0)):
+            mexido = np.zeros_like(binm)
+            mexido[dy:, dx:] = binm[:binm.shape[0] - dy, :binm.shape[1] - dx]
+            if visao.rotulo_novo(binm[:-8, :-8], mexido[:-8, :-8]):
+                falhas.append(f"runas/{arq}: rótulos mexidos ({dx}, {dy}) px contaram como novos")
+    # par real (1 s, nenhum item novo; o rótulo 'Limpwurt root' mudou 1-2 px): visto pela revisão
+    a = cv2.imread(os.path.join(PASTA, "runas", "231124_0112.png"))
+    b = cv2.imread(os.path.join(PASTA, "runas", "231125_0113.png"))
+    cx, cy = visao.CAPTURA_CALIBRADA[0] // 2, visao.CAPTURA_CALIBRADA[1] // 2
+    area = (slice(cy - 350, cy + 330), slice(cx - 390, cx + 330))  # o recorte de main.area_loot
+    if a is not None and b is not None and visao.rotulo_novo(visao.mascara_rotulos(a[area])[0],
+                                                             visao.mascara_rotulos(b[area])[0]):
+        falhas.append("runas/231124_0112 -> 231125_0113: rótulo que mudou 1-2 px contou como novo")
     print(f"Rótulo novo (loot sem osso): {n} rótulos")
+    return falhas
+
+
+def testar_matiz_vermelho():
+    """ensino.aprender_cor com monstro vermelho: o matiz do OpenCV dá a volta em 0/179. Gira o
+    matiz de quadros reais de Hill Giant para a pele cair na volta e confere que o perfil
+    aprendido acha todos os exemplos sem acender muito mais coisa que o aprendido sem giro."""
+    import ensino
+    caminho = os.path.join(PASTA, "rotulos.jsonl")
+    if not os.path.isfile(caminho):
+        return []
+    with open(caminho, encoding="utf-8") as f:
+        rots = [json.loads(linha) for linha in f if linha.strip()]
+    rots = [r for r in rots if r["classe"] == "hillgiant_ok"]
+    rots = rots[::max(len(rots) // 4, 1)][:4]
+    exemplos = [(cv2.imread(os.path.join(PASTA, r["arquivo"])), tuple(r["pos"])) for r in rots]
+    exemplos = [(img, pos) for img, pos in exemplos if img is not None]
+    if len(exemplos) < 2:
+        return []
+
+    def girar(img, d):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv[..., 0] = ((hsv[..., 0].astype(np.int16) + d) % 180).astype(np.uint8)
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    def avaliar(exs):
+        p = ensino.aprender_cor(exs)
+        perfil = {"cor": p["cor"], "area": p["area"], "fechar": ensino.FECHAR, "desloc_matiz": p["desloc_matiz"]}
+        achados, cands = 0, 0
+        for img, pos in exs:
+            c = visao.detectar_sapos(img, perfil)
+            cands += len(c)
+            achados += perto(pos, [s["pos"] for s in c], TOLERANCIA_SAPO)
+        return p, achados, cands
+
+    falhas = []
+    _, _, cands_base = avaliar([(girar(img, 0), pos) for img, pos in exemplos])
+    for d in (-10, -14, -17, 166):
+        p, achados, cands = avaliar([(girar(img, d), pos) for img, pos in exemplos])
+        if not p["desloc_matiz"]:
+            falhas.append(f"matiz girado {d}: aprendeu sem girar o matiz (caixa {p['cor']})")
+        if achados < len(exemplos):
+            falhas.append(f"matiz girado {d}: achou {achados}/{len(exemplos)} exemplos")
+        if cands > 1.5 * cands_base + 2:
+            falhas.append(f"matiz girado {d}: {cands} candidatos contra {cands_base} sem giro")
+    print(f"Monstro vermelho (matiz na volta 0/179): {len(exemplos)} exemplos, 4 giros")
     return falhas
 
 
 # ---------- Perfis aprendidos (ensinar.py) ----------
 def testar_perfis_aprendidos():
-    """Cada perfis/<nome>.json tem que achar o monstro em todos os quadros em que foi
-    ensinado, e o molde do texto tem que aceitar as faixas do ensino e recusar as de
-    "Take ..." / "Walk here" salvas em amostras/faixas."""
+    """Cada perfis/<nome>.json: o molde do texto tem que recusar as faixas "Take Big bones"
+    salvas em amostras/faixas (take-ok; as take-rej às vezes mostram "Attack Giant frog") e
+    aceitar as faixas do próprio ensino; o perfil tem que achar o monstro em todos os quadros
+    em que foi ensinado (perfis/<nome>_exemplos, que fica fora do git)."""
     import ensino  # só aqui: o resto dos testes não depende dele
-    falhas, n_perfis, n_ex = [], 0, 0
-    negativas = [cv2.imread(c) for c in sorted(glob.glob(os.path.join(PASTA, "faixas", "*take-*.png")))]
+    falhas, n_perfis, n_ex, sem_ex = [], 0, 0, []
+    negativas = [cv2.imread(c) for c in sorted(glob.glob(os.path.join(PASTA, "faixas", "*take-ok*.png")))]
+    negativas = [f for f in negativas if f is not None]
+    # o gerador só aceita texto de ataque
+    aceitas = sum(ensino.gerar_molde_texto(f)[0] is not None for f in negativas)
+    if aceitas:
+        falhas.append(f"ensino.gerar_molde_texto aceitou {aceitas} faixa(s) 'Take ...' sem 'Attack'")
     for nome in visao.perfis_disponiveis():
         if nome in visao.PERFIS and not visao.PERFIS[nome].get("aprendido"):
             continue
         perfil = visao.carregar_perfil(nome)
         n_perfis += 1
+        limiar = visao.limiar_texto(perfil["texto"])
+        pior = max((visao.score_texto(f, perfil["texto"]) for f in negativas), default=0.0)
+        if pior >= limiar:
+            falhas.append(f"perfis/{nome}: uma faixa 'Take ...' passa no molde ({pior:.3f})")
         pasta = os.path.join(visao.PASTA_PERFIS, f"{nome}_exemplos")
         lista = os.path.join(pasta, "exemplos.json")
         if not os.path.isfile(lista):
+            sem_ex.append(nome)
             continue
         with open(lista, encoding="utf-8") as f:
             exemplos = json.load(f)
@@ -605,17 +680,12 @@ def testar_perfis_aprendidos():
             n_ex += 1
             if not perto(e["pos"], [s["pos"] for s in visao.detectar_sapos(img, perfil)], TOLERANCIA_SAPO):
                 falhas.append(f"perfis/{nome}: exemplo {e['arquivo']} em {e['pos']} não detectado")
-        limiar = visao.limiar_texto(perfil["texto"])
         for c in sorted(glob.glob(os.path.join(pasta, "faixa_*.png"))):
             s = visao.score_texto(cv2.imread(c), perfil["texto"])
             if s < limiar:
                 falhas.append(f"perfis/{nome}: {os.path.basename(c)} dá {s:.3f} no próprio molde")
-        pior = max((visao.score_texto(f, perfil["texto"]) for f in negativas if f is not None), default=0.0)
-        if pior >= limiar:
-            falhas.append(f"perfis/{nome}: uma faixa 'Take ...' passa no molde ({pior:.3f})")
-        if ensino.gerar_molde_texto(negativas[0])[0] is not None if negativas else False:
-            falhas.append("ensino.gerar_molde_texto aceitou uma faixa sem 'Attack'")
-    print(f"Perfis aprendidos: {n_perfis}, {n_ex} exemplos")
+    extra = f" (sem quadros de ensino, só o molde testado: {', '.join(sem_ex)})" if sem_ex else ""
+    print(f"Perfis aprendidos: {n_perfis}, {n_ex} exemplos{extra}")
     return falhas
 
 
@@ -657,7 +727,7 @@ if __name__ == "__main__":
     for item in visao.ITENS_CHAO:
         falhas += testar_item_chao(item) + testar_item_menu(item)
     falhas += testar_rotulo_vizinho() + testar_menu_tem_take() + testar_take_acao()
-    falhas += testar_rotulo_novo() + testar_perfis_aprendidos()
+    falhas += testar_rotulo_novo() + testar_perfis_aprendidos() + testar_matiz_vermelho()
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:

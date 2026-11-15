@@ -100,7 +100,7 @@ class Ensino:
         """O perfil no formato de visao.PERFIS, para detectar com ele."""
         p = self.perfil
         return {"cor": (np.array(p["cor"][0]), np.array(p["cor"][1])),
-                "area": tuple(p["area"]), "fechar": p["fechar"]}
+                "area": tuple(p["area"]), "fechar": p["fechar"], "desloc_matiz": p.get("desloc_matiz", 0)}
 
     def resumo(self):
         pv = self.perfil_visao()
