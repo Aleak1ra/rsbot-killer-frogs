@@ -13,7 +13,6 @@ import os
 import time
 
 import cv2
-import numpy as np
 
 import visao
 
@@ -24,7 +23,10 @@ LIMIAR_BOTAO = 0.90
 ESPERA_DEPOIS_CLIQUE = 8.0  # s para a tela seguinte aparecer (e entre duas tentativas no mesmo botão)
 MAX_CLIQUES_HORA = 12  # mais que isso numa hora: algo está errado, para de clicar e avisa
 MAX_FOTOS = 30
-DIFERENCA_FOTO = 6.0  # média da diferença (0-255) na miniatura para considerar outra tela
+DIFERENCA_FOTO = 40  # diferença de tom (0-255) de um pixel que conta como mudança
+# faixa central da tela de login (caixa de mensagens e botões), sem as chamas animadas das laterais
+AREA_COMPARAR = (620, 180, 1320, 900)
+PIXELS_MUDOU = 300  # pixels mudados para ser outra tela (uma palavra nova já passa disso)
 
 
 def carregar_moldes(pasta=None):
@@ -138,12 +140,16 @@ class Reconexao:
         """Grava o quadro se for uma tela diferente da última gravada."""
         if self.fotos >= MAX_FOTOS:
             return False
-        mini = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (img.shape[1] // 8, img.shape[0] // 8),
-                          interpolation=cv2.INTER_AREA).astype(np.int16)
-        if self.ultima_miniatura is not None and \
-                np.abs(mini - self.ultima_miniatura).mean() < DIFERENCA_FOTO:
-            return False
-        self.ultima_miniatura = mini
+        x1, y1, x2, y2 = AREA_COMPARAR
+        cinza = cv2.cvtColor(img[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        # as telas de login só diferem na caixa do meio (outro texto, outro botão): conta os
+        # pixels que mudaram de tom; uma linha de texto nova dá centenas
+        anterior = self.ultima_miniatura
+        if anterior is not None and anterior.shape == cinza.shape:
+            mudou = int((cv2.absdiff(cinza, anterior) > DIFERENCA_FOTO).sum())
+            if mudou < PIXELS_MUDOU:
+                return False
+        self.ultima_miniatura = cinza
         self.fotos += 1
         os.makedirs(self.pasta_fotos, exist_ok=True)
         nome = time.strftime("%Y%m%d_%H%M%S") + f"_{self.fotos:02d}.png"
