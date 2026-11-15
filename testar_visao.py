@@ -645,6 +645,33 @@ def testar_matiz_vermelho():
     return falhas
 
 
+def testar_reconexao():
+    """reconexao: cada molde de botão em templates/login/ é achado na tela real dele (amostras/
+    telas/<nome>.png), com o clique dentro do botão, e não aparece nas outras telas nem nos
+    quadros de jogo (lá o bot não pode clicar em nada)."""
+    import reconexao
+    moldes = reconexao.carregar_moldes()
+    pasta = os.path.join(PASTA, "telas")
+    if not moldes or not os.path.isdir(pasta):
+        return []
+    falhas = []
+    telas = {os.path.splitext(f)[0]: cv2.imread(os.path.join(pasta, f)) for f in os.listdir(pasta)}
+    for nome, img in telas.items():
+        achados = reconexao.achar_moldes(img, moldes)
+        if nome in moldes and (not achados or achados[0][0] != nome):
+            falhas.append(f"telas/{nome}: o botão {nome} não foi o achado ({achados})")
+        outros = [a for a in achados if a[0] != nome]
+        if outros:
+            falhas.append(f"telas/{nome}: outro botão achado nela ({outros})")
+    jogo = frames_jogo(passo=6)
+    for caminho, img in jogo:
+        achados = reconexao.achar_moldes(img, moldes)
+        if achados:
+            falhas.append(f"{os.path.basename(caminho)}: botão de login achado num quadro de jogo ({achados})")
+    print(f"Volta ao jogo: {len(moldes)} botões, {len(telas)} telas, {len(jogo)} quadros de jogo")
+    return falhas
+
+
 # ---------- Perfis aprendidos (ensinar.py) ----------
 def testar_perfis_aprendidos():
     """Cada perfis/<nome>.json: o molde do texto tem que recusar as faixas "Take Big bones"
@@ -728,6 +755,7 @@ if __name__ == "__main__":
         falhas += testar_item_chao(item) + testar_item_menu(item)
     falhas += testar_rotulo_vizinho() + testar_menu_tem_take() + testar_take_acao()
     falhas += testar_rotulo_novo() + testar_perfis_aprendidos() + testar_matiz_vermelho()
+    falhas += testar_reconexao()
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:
