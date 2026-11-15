@@ -549,6 +549,22 @@ def mirar_parado(pos, detectar_local):
     return None
 
 
+def foto_menu_osso():
+    """Diagnóstico: grava o último menu de osso que falhou (logs/coleta_falhas/, até 10 por
+    sessão). Visto em 15/11: 8 de 544 menus de osso recusados sempre com nota ~0,901."""
+    global _fotos_menu_osso
+    rec = _ultimo_menu["rec"]
+    if rec is None or _fotos_menu_osso >= 10:
+        return
+    _fotos_menu_osso += 1
+    pasta = os.path.join(visao.BASE_DIR, "logs", "coleta_falhas")
+    os.makedirs(pasta, exist_ok=True)
+    cv2.imwrite(os.path.join(pasta, time.strftime("%H%M%S") + "_osso_menu.png"), rec)
+
+
+_fotos_menu_osso = 0
+
+
 def pegar_osso(img, ossos):
     for osso in sorted(ossos, key=lambda o: distancia(CENTRO, o["pos"]))[:2]:
         pos = osso["pos"]
@@ -582,6 +598,7 @@ def pegar_osso(img, ossos):
             if r is None:
                 return False  # clique cancelado: não passa para o próximo osso
             if not r:
+                foto_menu_osso()
                 salvar_amostra("osso_rej", img, pos, score=osso["score"])
                 continue
         salvar_amostra("osso_ok", img, pos, score=osso["score"])
