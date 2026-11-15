@@ -10,6 +10,7 @@ Uso:  python main.py [--monstro sapo|hillgiant] [--sem-vida] [--sem-runas] [--se
 Cada sessão grava um log de eventos em logs/sessao_*.jsonl; use
 `python analisar_log.py` para ver os tempos medidos.
 """
+import ctypes
 import json
 import os
 import random
@@ -221,6 +222,14 @@ def capturar(regiao=None):
 
 
 jogo_em_foco = tela.jogo_em_foco  # segue a janela ativa do jogo (ver tela.py)
+AVISO_INATIVO_SEG = 240  # fora de foco e sem entrada há isso: o jogo desconecta em ~1 min
+
+
+def titulo_janela_ativa():
+    """Título da janela em primeiro plano (para o log dizer quem tirou o foco do jogo)."""
+    buf = ctypes.create_unicode_buffer(120)
+    ctypes.windll.user32.GetWindowTextW(ctypes.windll.user32.GetForegroundWindow(), buf, 120)
+    return buf.value
 
 
 def tempo_mouse_parado():
@@ -252,11 +261,19 @@ def mover(pos):
     ultima_entrada = time.time()
 
 
-def clicar():
+def clicar(botao="left"):
+    """Clica só se o jogo seguir em foco e o usuário não tiver pegado o mouse: o laço confere
+    isso no começo do ciclo, mas o clique sai até ~2,8 s depois (menu). Um clique direito
+    caído no terminal cola o que estiver copiado. Devolve se clicou."""
     global pos_anterior, ultima_entrada
-    pyautogui.click()
+    mexeu = bool(np.linalg.norm(np.subtract(pyautogui.position(), pos_anterior)) > 2)
+    if mexeu or not jogo_em_foco():
+        LOG.ev("clique_cancelado", botao=botao, mouse_mexeu=mexeu)
+        return False
+    pyautogui.click(button=botao)
     pos_anterior = pyautogui.position()
     ultima_entrada = time.time()
+    return True
 
 
 def clicar_em(pos):
@@ -268,6 +285,7 @@ def clicar_em(pos):
 
 
 RECONEXAO = reconexao.Reconexao(clicar_em, LOG.ev)
+VIGIA_VIDA = visao.VigiaVida(VIDA_MINIMA, VIDA_RETOMAR, VIDA_CONFIRMACOES)
 
 def manter_conectado():
     """Parado (pausa por vida baixa), evita a desconexão por inatividade: depois de um
@@ -298,7 +316,8 @@ def clicar_conferindo(pos, classe):
     y = min(max(int(pos[1]), r), CAPTURE_REGION["height"] - r)
     regiao = (x - r, y - r, x + r, y + r)
     antes = capturar(regiao)
-    clicar()
+    if not clicar():
+        return "cancelado"
     inicio = time.perf_counter()
     tipo, depois = None, antes
     while tipo is None and time.perf_counter() - inicio < CLIQUE_TIMEOUT:
@@ -437,9 +456,9 @@ _ultimo_menu = {"rec": None, "regiao": None}  # o último menu lido (para a foto
 def pegar_pelo_menu(pos, achar=visao.achar_take_no_menu, item="osso"):
     """Pilha de itens: abre o menu e clica na linha que `achar` encontrar
     (por padrão "Take Big bones"; para runas, "Take ... rune")."""
-    global pos_anterior
-    pyautogui.click(button="right")
-    pos_anterior = pyautogui.position()
+    if not clicar("right"):
+        _ultimo_menu["rec"] = None
+        return None  # cancelado (sem foco ou o usuário no mouse): ninguém tenta de novo agora
     x, y = int(pos[0]), int(pos[1])
     regiao = (max(x - MENU_RAIO[0], 0), max(y - MENU_RAIO[1], 0),
               min(x + MENU_RAIO[0], CAPTURE_REGION["width"]),
@@ -459,8 +478,7 @@ def pegar_pelo_menu(pos, achar=visao.achar_take_no_menu, item="osso"):
         return False
     mover((regiao[0] + ponto[0], regiao[1] + ponto[1]))
     time.sleep(0.03)
-    clicar()
-    return True
+    return clicar()
 
 
 def procurar_take(pos):
@@ -489,14 +507,15 @@ def procurar_take(pos):
 def pegar_pelo_menu_pilha(pos, achar=visao.achar_take_no_menu, item="osso"):
     """pegar_pelo_menu na pilha; se o menu abriu sem nenhum "Take" (o clique caiu fora do
     item), procura com o mouse um ponto em volta onde o jogo mostre "Take" e tenta ali."""
-    if pegar_pelo_menu(pos, achar, item):
-        return True
+    r = pegar_pelo_menu(pos, achar, item)
+    if r or r is None:
+        return bool(r)
     if visao.menu_tem_take(_ultimo_menu["rec"]):
         return False  # a pilha estava certa, só não tinha o item
     ponto = procurar_take(pos)
     LOG.ev("menu_procura", item=item, achou=ponto is not None,
            desloc=None if ponto is None else [int(ponto[0] - pos[0]), int(ponto[1] - pos[1])])
-    return ponto is not None and pegar_pelo_menu(ponto, achar, item)
+    return ponto is not None and bool(pegar_pelo_menu(ponto, achar, item))
 
 
 def mirar_parado(pos, detectar_local):
@@ -546,7 +565,7 @@ def pegar_osso(img, ossos):
         if chave is not None:
             via = "direto"
             clique = clicar_conferindo(pos, "osso")
-            if clique == "chao":
+            if clique in ("chao", "cancelado"):
                 LOG.ev("pegar_osso", ok=False, lat=0.0, dist=round(dist), clique=clique, via=via)
                 return False
         else:
@@ -743,7 +762,7 @@ def atacar_sapo(img, sapos, t_quadro=None):
             pos = novo
         desloc = None if desloc is None else round(desloc, 1)
         clique = clicar_conferindo(pos, "sapo")
-        if clique == "chao":  # o sapo pulou: tenta de novo no próximo ciclo, com posições novas
+        if clique in ("chao", "cancelado"):  # o sapo pulou (ou clique cancelado): próximo ciclo
             LOG.ev("atacar", ok=False, lat=0.0, dist=round(dist), barra=barra, clique=clique,
                    desloc=desloc)
             return False
@@ -816,7 +835,8 @@ def loop_principal():
     em_luta = False
     inicio_luta = 0.0
     em_foco = True
-    vigia_vida = visao.VigiaVida(VIDA_MINIMA, VIDA_RETOMAR, VIDA_CONFIRMACOES)
+    avisou_inativo = False
+    vigia_vida = VIGIA_VIDA  # do módulo: um recomeço do laço (erro) não esquece a pausa
     ultima_vida = 0.0
     sem_leitura_desde = None  # início da sequência atual de leituras vazias do orbe
     avisou_sem_leitura = False
@@ -826,14 +846,20 @@ def loop_principal():
     while True:
         if not jogo_em_foco():
             if em_foco:
-                LOG.ev("foco", ok=False)
+                LOG.ev("foco", ok=False, janela=titulo_janela_ativa())
                 em_foco = False
+            elif not avisou_inativo and time.time() - ultima_entrada > AVISO_INATIVO_SEG:
+                avisou_inativo = True
+                LOG.ev("inativo_fora_de_foco", seg=round(time.time() - ultima_entrada))
+                print("\n⚠️ Jogo fora de foco e sem entrada há 4 min: ele desconecta em ~1 min. "
+                      "Volte o foco para o jogo (se desconectar, o bot volta sozinho).")
             sem_leitura_desde = None  # tempo fora do jogo não conta como falha de leitura
             time.sleep(0.5)
             continue
         if not em_foco:
             LOG.ev("foco", ok=True)
             em_foco = True
+            avisou_inativo = False
             time.sleep(ESPERA_TELA_ASSENTAR)  # logo após o Alt+Tab a tela ainda é a transição
             continue
 
@@ -954,6 +980,13 @@ def loop_principal():
         if em_luta and estado != "lutando":
             em_luta = False
             LOG.ev("fim_combate", dur=round(time.time() - inicio_luta, 2), estado=estado)
+            if estado == "morto":
+                # só medição: há monstro livre perto na hora da morte? (decide se vale atacar
+                # antes de o loot cair, ~2,5 s por monstro; ver analisar-logs-madrugada)
+                viz = sorted((round(distancia(CENTRO, s["pos"])),
+                              visao.barra_vida_perto(img, s["pos"], *PERFIL["barra"]))
+                             for s in visao.detectar_sapos(img, PERFIL))
+                LOG.ev("vizinhos_fim", viz=viz[:5])
             if coletar and estado == "morto":
                 if inventario and ENTERRO.pode():
                     ENTERRO.um(inventario, "loot")
@@ -1040,14 +1073,36 @@ def loop_atalhos():
 
 
 def executar_principal():
-    try:
-        loop_principal()
-    except pyautogui.FailSafeException:
-        print("\n🛑 Mouse no canto da tela: bot encerrado (failsafe).")
-    except Exception:
-        import traceback
+    """Roda o laço; um erro inesperado (ex.: falha passageira da captura de tela) vai para o
+    log e o laço recomeça em 5 s, mantendo a pausa por vida (VIGIA_VIDA). 3 erros em 10 min
+    encerram o bot, como antes."""
+    import traceback
 
-        traceback.print_exc()
+    erros = []
+    while True:
+        try:
+            loop_principal()
+        except pyautogui.FailSafeException:
+            LOG.ev("encerrado", motivo="failsafe", mouse=list(pyautogui.position()))
+            print("\n🛑 Mouse no canto da tela: bot encerrado (failsafe).")
+            break
+        except Exception as erro:
+            traceback.print_exc()
+            sct = _local.__dict__.pop("sct", None)  # recria a captura do zero
+            if sct is not None:
+                try:
+                    sct.close()
+                except Exception:
+                    pass
+            agora = time.time()
+            erros = [t for t in erros if agora - t < 600] + [agora]
+            LOG.ev("erro", tipo=type(erro).__name__, msg=str(erro)[:200],
+                   onde=traceback.format_exc()[-1500:], seguidos=len(erros))
+            if len(erros) >= 3:
+                print("\n🛑 3 erros em 10 min: bot encerrado (evento 'erro' no log).")
+                break
+            print("\n⚠️ Erro inesperado (evento 'erro' no log): recomeço em 5 s.")
+            time.sleep(5)
     os._exit(1)
 
 
