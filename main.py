@@ -23,6 +23,7 @@ import numpy as np
 import pyautogui
 from mss import mss
 
+import reconexao
 import tela
 import visao
 
@@ -257,6 +258,16 @@ def clicar():
     pos_anterior = pyautogui.position()
     ultima_entrada = time.time()
 
+
+def clicar_em(pos):
+    """Move até `pos` (coordenadas da captura) e clica (botões das telas de login)."""
+    mover(pos)
+    time.sleep(0.15)
+    clicar()
+
+
+
+RECONEXAO = reconexao.Reconexao(clicar_em, LOG.ev)
 
 def manter_conectado():
     """Parado (pausa por vida baixa), evita a desconexão por inatividade: depois de um
@@ -858,6 +869,12 @@ def loop_principal():
         # espera; ele não age nele (exceto com --sem-vida, que desliga essa checagem).
         caixa = visao.diferenca_caixa_vida(img)
         alinhado = SEM_VIDA or caixa <= visao.CAIXA_VIDA_LIMIAR
+        # Sem a interface por muito tempo (desconectado?): grava a tela e, se reconhecer o
+        # botão, volta ao jogo (reconexao.py; nunca digita nada)
+        if alinhado:
+            RECONEXAO.no_jogo()
+        else:
+            RECONEXAO.fora_do_jogo(img)
 
         # Segurança: vida do jogador pelo orbe (None = não teve certeza de ler o orbe)
         vida = None if SEM_VIDA else visao.vida_pct(img)
