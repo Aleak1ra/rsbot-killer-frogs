@@ -275,6 +275,8 @@ def tem_take_acao(faixa):
 # ---------- Menu de botão direito ----------
 # Medido em 20 menus: a linha "Take Big bones" dá >= 0,97; "Examine Big bones" <= 0,86.
 MENU_THRESHOLD = 0.91
+MENU_THRESHOLD_COM_TAKE = 0.88  # abaixo de MENU_THRESHOLD, só com "Take" no começo da linha
+MENU_TAKE_LINHA = 0.80
 
 
 def achar_take_no_menu(img_regiao):
@@ -283,12 +285,23 @@ def achar_take_no_menu(img_regiao):
     Devolve ((x, y) do centro da linha dentro do recorte, score) ou (None, score).
     """
     tpl = MENU_TAKE
-    res = cv2.matchTemplate(mascara_texto(img_regiao), tpl, cv2.TM_CCOEFF_NORMED)
+    mt = mascara_texto(img_regiao)
+    res = cv2.matchTemplate(mt, tpl, cv2.TM_CCOEFF_NORMED)
     _, score, _, loc = cv2.minMaxLoc(res)
-    if score < MENU_THRESHOLD:
-        return None, float(score)
     h, w = tpl.shape[:2]
-    return (loc[0] + w // 2, loc[1] + h // 2), float(score)
+    if score >= MENU_THRESHOLD:
+        return (loc[0] + w // 2, loc[1] + h // 2), float(score)
+    # "Take Big bones" fora da 1ª linha (ex.: abaixo de "Take Coins (5)") dá ~0,90: aceita se a
+    # palavra "Take" estiver no começo dessa mesma linha. Medido em 47 menus: linhas "Take Big
+    # bones" >= 0,90 com "Take" >= 0,868; as outras ("Examine Big bones") <= 0,855 com "Take" <= 0,54.
+    th, tw = MENU_TAKE_PALAVRA.shape
+    for x, y, s in picos(res, MENU_THRESHOLD_COM_TAKE, 30, 8, limite=4):
+        faixa = mt[max(y - 3, 0):y + h + 3, max(x - 3, 0):x + tw + 8]
+        if faixa.shape[0] < th or faixa.shape[1] < tw:
+            continue
+        if float(cv2.matchTemplate(faixa, MENU_TAKE_PALAVRA, cv2.TM_CCOEFF_NORMED).max()) >= MENU_TAKE_LINHA:
+            return (x + w // 2, y + h // 2), float(s)
+    return None, float(score)
 
 
 # ---------- Vida do jogador ----------
