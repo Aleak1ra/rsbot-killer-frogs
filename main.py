@@ -451,6 +451,8 @@ def salvar_menu(rec, ok, item="osso"):
 
 
 _ultimo_menu = {"rec": None, "regiao": None}  # o último menu lido (para a foto de falha)
+# a tela não parou a tempo (mirar_parado): o quadro do ciclo ficou velho (~1 s) para o ataque
+_mira = {"perdida": False}
 
 
 def pegar_pelo_menu(pos, achar=visao.achar_take_no_menu, item="osso"):
@@ -508,14 +510,18 @@ def pegar_pelo_menu_pilha(pos, achar=visao.achar_take_no_menu, item="osso"):
     """pegar_pelo_menu na pilha; se o menu abriu sem nenhum "Take" (o clique caiu fora do
     item), procura com o mouse um ponto em volta onde o jogo mostre "Take" e tenta ali."""
     r = pegar_pelo_menu(pos, achar, item)
-    if r or r is None:
-        return bool(r)
+    if r is None:
+        return None  # clique cancelado (sem foco ou o usuário no mouse): não insiste
+    if r:
+        return True
     if visao.menu_tem_take(_ultimo_menu["rec"]):
         return False  # a pilha estava certa, só não tinha o item
     ponto = procurar_take(pos)
     LOG.ev("menu_procura", item=item, achou=ponto is not None,
            desloc=None if ponto is None else [int(ponto[0] - pos[0]), int(ponto[1] - pos[1])])
-    return ponto is not None and bool(pegar_pelo_menu(ponto, achar, item))
+    if ponto is None:
+        return False
+    return pegar_pelo_menu(ponto, achar, item)
 
 
 def mirar_parado(pos, detectar_local):
@@ -550,6 +556,7 @@ def pegar_osso(img, ossos):
             pos = mirar_parado(pos, lambda rec, o: [b["pos"] for b in visao.detectar_ossos_chao(rec, origem=o)])
             if pos is None:
                 LOG.ev("mira_perdida", item="osso")
+                _mira["perdida"] = True
                 return False
         dist = distancia(CENTRO, pos)
         mover(pos)
@@ -571,7 +578,10 @@ def pegar_osso(img, ossos):
         else:
             # Outro item por cima do osso (ou um monstro em cima da pilha)
             via, clique = "menu", None
-            if not pegar_pelo_menu_pilha(pos):
+            r = pegar_pelo_menu_pilha(pos)
+            if r is None:
+                return False  # clique cancelado: não passa para o próximo osso
+            if not r:
                 salvar_amostra("osso_rej", img, pos, score=osso["score"])
                 continue
         salvar_amostra("osso_ok", img, pos, score=osso["score"])
@@ -668,6 +678,7 @@ class ColetaChao:
             i["pos"] for i in visao.detectar_itens_chao(rec, self.item, origem=o)])
         if pos is None:
             LOG.ev("mira_perdida", item=self.item)
+            _mira["perdida"] = True
             return False
         if distancia(pos, alvo["pos"]) > MIRA_PARADO_PX:
             alvo = dict(alvo, pos=pos)
@@ -680,7 +691,10 @@ class ColetaChao:
         mover(pos)
         time.sleep(0.05)
         achar = lambda rec: visao.achar_take_item_no_menu(rec, self.item)  # noqa: E731
-        if not pegar_pelo_menu_pilha(pos, achar, self.item):
+        r = pegar_pelo_menu_pilha(pos, achar, self.item)
+        if r is None:
+            return False  # clique cancelado: não é falha da pilha
+        if not r:
             LOG.ev(evento, ok=False, motivo="menu", dist=round(dist), score=alvo["score"], pos=list(pos))
             salvar_amostra(f"{self.item}_rej", img, pos, score=alvo["score"])
             self._falhou(img, alvo, "menu")
@@ -1042,6 +1056,18 @@ def loop_principal():
                 ossos_pegos += 1
                 print(f"🦴 Ossos coletados do chão: {ossos_pegos}")
                 continue
+
+        # A espera da mira deixou o quadro velho (~1 s, tela andando): ataca por um quadro novo,
+        # conferido como o do começo do ciclo (visto: 2 hovers falhos com quadro de 1,0-1,3 s)
+        if _mira["perdida"]:
+            _mira["perdida"] = False
+            img = capturar()
+            t0 = time.perf_counter()
+            desalinhado = visao.diferenca_caixa_vida(img) > visao.CAIXA_VIDA_LIMIAR
+            if desalinhado or visao.estado_combate(img) == "lutando":
+                continue
+            sapos = visao.detectar_sapos(img, PERFIL)
+            LOG.ev("quadro_renovado", n_sapos=len(sapos))
 
         # Atacar o sapo mais próximo
         LOG.ev("ciclo", captura=round(t1 - t0, 4), rotulos=round(t4 - t3, 4),
