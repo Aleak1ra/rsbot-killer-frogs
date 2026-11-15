@@ -84,10 +84,13 @@ COLETA_IGNORAR_SEG = 60.0  # pilha que falhou fica ignorada por esse tempo (as o
 COLETA_IGNORAR_RAIO = 25  # px em volta da pilha que falhou
 COLETA_FALHAS_PAUSA = 3  # falhas seguidas -> deixa aquele item de lado por COLETA_PAUSA s
 COLETA_PAUSA = 30.0
-# Conferência da coleta pelo inventário: px que mudaram de tom (> INVENTARIO_DIF_TOM em
-# algum canal) para contar como mudança (o número de uma pilha trocando já dá dezenas)
+# Conferência da coleta pelo inventário (só a área dos itens, visao.INVENTARIO_ITENS): px
+# que mudaram de tom (> INVENTARIO_DIF_TOM em algum canal). Medido em 429 pares de quadros:
+# sem mudança, 0 px; um dígito trocando ("6" -> "8" numa pilha de runas), 17 px.
 INVENTARIO_DIF_TOM = 40
-INVENTARIO_DIF_PX = 20  # medido: entre quadros sem mudança, no máximo ~11 px variam
+INVENTARIO_DIF_PX = 6
+INVENTARIO_ESPERA_MIN = 0.25  # s após o clique antes de aceitar a mudança (filtra as passageiras)
+INVENTARIO_RAPIDA = 0.4  # coleta confirmada antes disso grava o inventário antes|depois (diagnóstico)
 COLETA_SOB_PERSONAGEM = 90  # px do centro: depois de andar até a pilha, ela fica aqui
 # Onde procurar o item (texto de ação "Take") quando o clique caiu fora dele: primeiro uma
 # linha de rótulo abaixo, depois em volta
@@ -567,6 +570,17 @@ class ColetaChao:
         if depois is not None:
             cv2.imwrite(os.path.join(pasta, nome + "_depois.png"), depois)
 
+    def _foto_inventario(self, antes, depois):
+        """Inventário antes|depois lado a lado (coleta confirmada rápido demais)."""
+        global _fotos_falha
+        if _fotos_falha >= COLETA_MAX_FOTOS:
+            return
+        _fotos_falha += 1
+        pasta = os.path.join(visao.BASE_DIR, "logs", "coleta_falhas")
+        os.makedirs(pasta, exist_ok=True)
+        cv2.imwrite(os.path.join(pasta, time.strftime("%H%M%S") + f"_{self.item}_inventario_rapido.png"),
+                    np.hstack([antes, depois]))
+
     def _falhou(self, img, alvo, motivo, depois=None, ignorar="alvo"):
         """`ignorar`: ponto da tela onde a pilha que falhou está agora ("alvo" = onde estava
         no início; None = não se sabe, não ignora nada)."""
@@ -597,7 +611,7 @@ class ColetaChao:
         # Inventário de referência: um osso enterrado há pouco ainda pode sumir dele
         while time.time() - ENTERRO.ultimo < INTERVALO_ENTERRAR:
             time.sleep(0.05)
-        inv_antes = capturar(visao.INVENTARIO)
+        inv_antes = capturar(visao.INVENTARIO_ITENS)
         mover(pos)
         time.sleep(0.05)
         achar = lambda rec: visao.achar_take_item_no_menu(rec, self.item)  # noqa: E731
@@ -613,18 +627,27 @@ class ColetaChao:
         # longas (a tela desliza e outra pilha do item entra no caminho). Duas leituras
         # seguidas, para um redesenho isolado não contar.
         seguidas = [0]
+        leitura = {"inv": inv_antes, "px": 0}
+        clique = time.perf_counter()
 
         def mudou():
-            dif = cv2.absdiff(capturar(visao.INVENTARIO), inv_antes).max(axis=2) > INVENTARIO_DIF_TOM
-            seguidas[0] = seguidas[0] + 1 if int(dif.sum()) >= INVENTARIO_DIF_PX else 0
+            leitura["inv"] = capturar(visao.INVENTARIO_ITENS)
+            dif = cv2.absdiff(leitura["inv"], inv_antes).max(axis=2) > INVENTARIO_DIF_TOM
+            leitura["px"] = int(dif.sum())
+            if time.perf_counter() - clique < INVENTARIO_ESPERA_MIN:
+                return False  # mudança antes disso não pode ser a coleta (passageira)
+            seguidas[0] = seguidas[0] + 1 if leitura["px"] >= INVENTARIO_DIF_PX else 0
             return seguidas[0] >= 2
 
         ok, dt = esperar(mudou, ESPERA_PEGAR_ITEM + dist / 150, 0.1)
-        LOG.ev(evento, ok=ok, lat=round(dt, 3), dist=round(dist), score=alvo["score"], pos=list(pos))
+        LOG.ev(evento, ok=ok, lat=round(dt, 3), dist=round(dist), score=alvo["score"], pos=list(pos),
+               inv_px=leitura["px"])
         if ok:
             self.falhas = 0
             self.total += 1
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
+            if dt < INVENTARIO_RAPIDA:  # diagnóstico: o que mudou no inventário tão rápido?
+                self._foto_inventario(inv_antes, leitura["inv"])
         else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
             depois = capturar()
