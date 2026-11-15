@@ -1,0 +1,46 @@
+{
+  "nome": "Hill Giant (aprendido)",
+  "cor": [
+    [
+      11,
+      101,
+      94
+    ],
+    [
+      19,
+      136,
+      217
+    ]
+  ],
+  "area": [
+    312,
+    4992
+  ],
+  "fechar": 5,
+  "espera_loot": 4.5,
+  "loot_menu": true,
+  "osso": "Big bones",
+  "texto": {
+    "limiar": 0.95,
+    "altura": 24,
+    "largura": 223,
+    "molde": "hillgiant_aprendido_texto.png"
+  },
+  "aprendido": {
+    "exemplos": 4,
+    "area_ref": 1248.0,
+    "caixa_ref": [
+      37,
+      70
+    ],
+    "vazamento": 0.0
+  },
+  "barra": [
+    52,
+    140,
+    42
+  ],
+  "raio_mira": 133,
+  "area_mira": 312,
+  "exemplos": "hillgiant_aprendido_exemplos"
+}

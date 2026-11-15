@@ -548,6 +548,77 @@ def testar_runas_menu():
     return testar_item_menu("runa")
 
 
+def testar_rotulo_novo():
+    """visao.rotulo_novo (loot de monstro sem "Big bones"): um rótulo de moedas real que
+    aparece conta; o mesmo quadro sem mudança e um borrão branco do tamanho do número de um
+    hitsplat (até 25 px) não contam."""
+    caminho = os.path.join(PASTA, "runas", "esperado_moedas.json")
+    if not os.path.isfile(caminho):
+        return []
+    with open(caminho, encoding="utf-8") as f:
+        esperado = json.load(f)
+    falhas, n = [], 0
+    for arq, exp in sorted(esperado.items()):
+        img = cv2.imread(os.path.join(PASTA, "runas", arq))
+        if img is None or not exp["rotulos"]:
+            continue
+        binm = visao.mascara_rotulos(img)[0]
+        for x, y in exp["rotulos"]:
+            n += 1
+            # o rótulo inteiro (a palavra "Coins" e o resto da linha à direita) ainda não existia
+            antes = binm.copy()
+            antes[max(y - 2, 0):y + 14, max(x - 4, 0):x + 90] = False
+            if not visao.rotulo_novo(antes, binm):
+                falhas.append(f"runas/{arq}: rótulo de moedas em {(x, y)} não contou como novo")
+        if visao.rotulo_novo(binm, binm):
+            falhas.append(f"runas/{arq}: quadro igual contou como rótulo novo")
+        for largura in (12, 20, 25):
+            agora = binm.copy()
+            agora[600:612, 900:900 + largura] = True
+            if visao.rotulo_novo(binm, agora):
+                falhas.append(f"runas/{arq}: borrão de {largura} px contou como rótulo novo")
+    print(f"Rótulo novo (loot sem osso): {n} rótulos")
+    return falhas
+
+
+# ---------- Perfis aprendidos (ensinar.py) ----------
+def testar_perfis_aprendidos():
+    """Cada perfis/<nome>.json tem que achar o monstro em todos os quadros em que foi
+    ensinado, e o molde do texto tem que aceitar as faixas do ensino e recusar as de
+    "Take ..." / "Walk here" salvas em amostras/faixas."""
+    import ensino  # só aqui: o resto dos testes não depende dele
+    falhas, n_perfis, n_ex = [], 0, 0
+    negativas = [cv2.imread(c) for c in sorted(glob.glob(os.path.join(PASTA, "faixas", "*take-*.png")))]
+    for nome in visao.perfis_disponiveis():
+        if nome in visao.PERFIS and not visao.PERFIS[nome].get("aprendido"):
+            continue
+        perfil = visao.carregar_perfil(nome)
+        n_perfis += 1
+        pasta = os.path.join(visao.PASTA_PERFIS, f"{nome}_exemplos")
+        lista = os.path.join(pasta, "exemplos.json")
+        if not os.path.isfile(lista):
+            continue
+        with open(lista, encoding="utf-8") as f:
+            exemplos = json.load(f)
+        for e in exemplos:
+            img = cv2.imread(os.path.join(pasta, e["arquivo"]))
+            n_ex += 1
+            if not perto(e["pos"], [s["pos"] for s in visao.detectar_sapos(img, perfil)], TOLERANCIA_SAPO):
+                falhas.append(f"perfis/{nome}: exemplo {e['arquivo']} em {e['pos']} não detectado")
+        limiar = visao.limiar_texto(perfil["texto"])
+        for c in sorted(glob.glob(os.path.join(pasta, "faixa_*.png"))):
+            s = visao.score_texto(cv2.imread(c), perfil["texto"])
+            if s < limiar:
+                falhas.append(f"perfis/{nome}: {os.path.basename(c)} dá {s:.3f} no próprio molde")
+        pior = max((visao.score_texto(f, perfil["texto"]) for f in negativas if f is not None), default=0.0)
+        if pior >= limiar:
+            falhas.append(f"perfis/{nome}: uma faixa 'Take ...' passa no molde ({pior:.3f})")
+        if ensino.gerar_molde_texto(negativas[0])[0] is not None if negativas else False:
+            falhas.append("ensino.gerar_molde_texto aceitou uma faixa sem 'Attack'")
+    print(f"Perfis aprendidos: {n_perfis}, {n_ex} exemplos")
+    return falhas
+
+
 # ---------- Geometria da janela ----------
 def testar_geometria():
     """Onde capturar dada a área do jogo na tela (medido: maximizada = (0, 29, 1920, 1121))."""
@@ -586,6 +657,7 @@ if __name__ == "__main__":
     for item in visao.ITENS_CHAO:
         falhas += testar_item_chao(item) + testar_item_menu(item)
     falhas += testar_rotulo_vizinho() + testar_menu_tem_take() + testar_take_acao()
+    falhas += testar_rotulo_novo() + testar_perfis_aprendidos()
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:

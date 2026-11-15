@@ -3,6 +3,7 @@
 Ficam separadas do bot para poderem ser testadas offline com frames salvos
 (ver testar_visao.py).
 """
+import json
 import os
 
 import cv2
@@ -108,6 +109,54 @@ PERFIS = {
 }
 
 
+PASTA_PERFIS = os.path.join(BASE_DIR, "perfis")
+
+
+def perfis_disponiveis():
+    """Nomes aceitos em --monstro: os embutidos e os aprendidos (perfis/<nome>.json)."""
+    aprendidos = []
+    if os.path.isdir(PASTA_PERFIS):
+        aprendidos = sorted(f[:-5] for f in os.listdir(PASTA_PERFIS) if f.endswith(".json"))
+    return list(PERFIS) + [n for n in aprendidos if n not in PERFIS]
+
+
+def carregar_perfil(nome):
+    """Perfil pelo nome: os embutidos (PERFIS) não mudam; senão lê perfis/<nome>.json, gerado
+    por ensinar.py, e registra o molde do texto de ação dele. KeyError se não existir."""
+    if nome in PERFIS:
+        return PERFIS[nome]
+    caminho = os.path.join(PASTA_PERFIS, f"{nome}.json")
+    if not os.path.isfile(caminho):
+        raise KeyError(nome)
+    with open(caminho, encoding="utf-8") as f:
+        d = json.load(f)
+    chave = f"perfil_{nome}"
+    molde = cv2.imread(os.path.join(PASTA_PERFIS, d["texto"]["molde"]), cv2.IMREAD_GRAYSCALE)
+    if molde is None:
+        raise FileNotFoundError(os.path.join(PASTA_PERFIS, d["texto"]["molde"]))
+    TEXTOS[chave] = molde
+    MASCARA_TEXTO_CHAVE[chave] = mascara_texto_geral
+    LIMIAR_TEXTO_CHAVE[chave] = float(d["texto"].get("limiar", 0.95))
+    perfil = {
+        "nome": d["nome"],
+        "texto": chave,
+        "cor": (np.array(d["cor"][0]), np.array(d["cor"][1])),
+        "area": tuple(d["area"]),
+        "fechar": int(d.get("fechar", 5)),
+        "barra": tuple(d["barra"]),
+        "raio_mira": int(d["raio_mira"]),
+        "area_mira": int(d["area_mira"]),
+        "espera_loot": float(d.get("espera_loot", 4.5)),
+        "loot_menu": bool(d.get("loot_menu", True)),
+        # o bot só conhece "Big bones"; com osso nulo ele não pega nem enterra ossos e
+        # espera o loot por qualquer rótulo novo no chão (main.esperar_loot_rotulo)
+        "osso": d.get("osso", "Big bones") is not None,
+        "aprendido": True,
+    }
+    PERFIS[nome] = perfil
+    return perfil
+
+
 def mascara_monstro(img, perfil):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, perfil["cor"][0], perfil["cor"][1])
@@ -160,10 +209,35 @@ def mascara_texto(img):
     return cv2.GaussianBlur(m, (3, 3), 0)
 
 
+def mascara_texto_geral(img):
+    """Como mascara_texto, mas aceita o nível do monstro em qualquer cor: o jogo pinta o
+    "(level-N)" de verde, amarelo-esverdeado, laranja ou vermelho conforme a diferença de
+    nível. Usada nos moldes aprendidos (perfis/*.json)."""
+    b, g, r = (img[:, :, i].astype(np.int16) for i in range(3))
+    branco = (r > 200) & (g > 200) & (b > 200)
+    quente = (np.maximum(r, g) > 200) & (b < 90)  # amarelo, verdes, laranjas, vermelho
+    laranja = (r > 200) & (g > 100) & (g < 190) & (b < 110)
+    ciano = (r < 90) & (g > 200) & (b > 200)
+    m = (branco | quente | laranja | ciano).astype(np.uint8) * 255
+    return cv2.GaussianBlur(m, (3, 3), 0)
+
+
+# Moldes aprendidos (carregar_perfil) usam outra máscara e um limiar próprio
+MASCARA_TEXTO_CHAVE = {}
+LIMIAR_TEXTO_CHAVE = {}
+
+
 def score_texto(faixa, chave):
     """Semelhança (0-1) entre a faixa do texto de ação e o template `chave`."""
-    res = cv2.matchTemplate(mascara_texto(faixa), TEXTOS[chave], cv2.TM_CCOEFF_NORMED)
-    return float(res.max())
+    tpl = TEXTOS[chave]
+    m = MASCARA_TEXTO_CHAVE.get(chave, mascara_texto)(faixa)
+    if m.shape[0] < tpl.shape[0] or m.shape[1] < tpl.shape[1]:
+        return 0.0
+    return float(cv2.matchTemplate(m, tpl, cv2.TM_CCOEFF_NORMED).max())
+
+
+def limiar_texto(chave):
+    return LIMIAR_TEXTO_CHAVE.get(chave, TEXTO_THRESHOLD)
 
 
 def faixa_texto(img):
@@ -506,6 +580,22 @@ ROTULO_ESPACO_MAX = 10
 # "Coins [x N]".
 ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0)}
 DENTRO_MARGEM = 6  # px da borda da área do jogo: clique mais perto que isso é recusado
+
+
+def rotulo_novo(binm_antes, binm_agora, largura_min=ROTULO_LARGURA_MIN):
+    """Apareceu uma linha de texto branco nova, do tamanho de um rótulo de item, entre as
+    duas máscaras (mascara_rotulos(...)[0] do mesmo recorte, com a tela parada)?
+
+    Para saber que o loot caiu sem conhecer o item. Pedaços pequenos (o número branco de
+    um hitsplat, ~10-25 px de largura) não contam: só linhas com >= `largura_min` px."""
+    novo = binm_agora & ~cv2.dilate(binm_antes.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    if novo.sum() < largura_min:
+        return False
+    # junta as letras de uma mesma linha (o espaço entre palavras é < 10 px)
+    linhas = cv2.dilate(novo.astype(np.uint8), np.ones((3, ROTULO_ESPACO_MAX), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(linhas, connectivity=8)
+    return any(st[k, cv2.CC_STAT_WIDTH] >= largura_min and st[k, cv2.CC_STAT_HEIGHT] <= 24
+               for k in range(1, n))
 
 
 def dentro_do_jogo(pos, margem=DENTRO_MARGEM):

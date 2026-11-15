@@ -248,7 +248,7 @@ def esperar_texto(chaves, timeout=HOVER_TIMEOUT):
         for c in chaves:
             s = visao.score_texto(faixa, c)
             melhores[c] = max(melhores[c], s)
-            if achou is None and s >= visao.TEXTO_THRESHOLD:
+            if achou is None and s >= visao.limiar_texto(c):
                 achou = c
         if achou is not None and achou == anterior:
             return achou, dt, melhores

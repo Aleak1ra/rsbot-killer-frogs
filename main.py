@@ -20,7 +20,6 @@ import cv2
 import keyboard
 import numpy as np
 import pyautogui
-import pygetwindow as gw
 from mss import mss
 
 import tela
@@ -28,9 +27,10 @@ import visao
 
 # Perfil do monstro: python main.py --monstro hillgiant
 NOME_PERFIL = sys.argv[sys.argv.index("--monstro") + 1] if "--monstro" in sys.argv else "sapo"
-if NOME_PERFIL not in visao.PERFIS:
-    sys.exit(f"Monstro desconhecido: {NOME_PERFIL}. Opções: {', '.join(visao.PERFIS)}")
-PERFIL = visao.PERFIS[NOME_PERFIL]
+try:  # embutido (visao.PERFIS) ou aprendido com ensinar.py (perfis/<nome>.json)
+    PERFIL = visao.carregar_perfil(NOME_PERFIL)
+except KeyError:
+    sys.exit(f"Monstro desconhecido: {NOME_PERFIL}. Opções: {', '.join(visao.perfis_disponiveis())}")
 
 # ========== Configurações ==========
 TITULO_JANELA = "Old School RuneScape"
@@ -311,7 +311,7 @@ def esperar_texto(chaves, timeout=HOVER_TIMEOUT):
         for c in chaves:
             s = visao.score_texto(faixa, c)
             melhores[c] = max(melhores[c], s)
-            if achou is None and s >= visao.TEXTO_THRESHOLD:
+            if achou is None and s >= visao.limiar_texto(c):
                 achou = c
         if achou is not None and achou == anterior:
             return achou, dt, melhores, faixa
@@ -717,6 +717,23 @@ def atacar_sapo(img, sapos, t_quadro=None):
     return False
 
 
+def area_loot():
+    """Região em volta do personagem onde o loot da luta cai (esperar_loot)."""
+    return (CENTRO[0] - RAIO_LOOT - 70, CENTRO[1] - RAIO_LOOT - 30,
+            CENTRO[0] + RAIO_LOOT + 10, CENTRO[1] + RAIO_LOOT + 10)
+
+
+def esperar_loot_rotulo(inicio):
+    """Monstro sem "Big bones" (perfil aprendido com osso nulo): espera aparecer texto
+    branco novo de rótulo de item em volta do personagem, ou o tempo do perfil acabar."""
+    area = area_loot()
+    base = visao.mascara_rotulos(capturar(area))[0]
+    restante = max(ESPERA_LOOT - (time.perf_counter() - inicio), 0.1)
+    ok, _ = esperar(lambda: visao.rotulo_novo(base, visao.mascara_rotulos(capturar(area))[0]), restante, 0.05)
+    LOG.ev("loot", ok=ok, lat=round(time.perf_counter() - inicio, 3), via="rotulo")
+    return ok
+
+
 def recorte_loot(raio):
     """(x1, y1, x2, y2) da janela onde cabe todo rótulo de loot a até `raio` px do
     personagem: os rótulos ficam acima da pilha (até 8 linhas de 22 px) e se estendem
@@ -730,8 +747,7 @@ def recorte_loot(raio):
 def esperar_loot(inicio):
     """O osso só aparece ~2 s depois da barra de vida zerar: espera por ele."""
     # Só olha em volta do personagem: ~10x mais rápido que varrer a janela toda
-    area = (CENTRO[0] - RAIO_LOOT - 70, CENTRO[1] - RAIO_LOOT - 30,
-            CENTRO[0] + RAIO_LOOT + 10, CENTRO[1] + RAIO_LOOT + 10)
+    area = area_loot()
 
     def osso_perto():
         ossos = visao.detectar_ossos_chao(capturar(area), origem=area[:2])
@@ -869,7 +885,7 @@ def loop_principal():
             time.sleep(0.2)
             continue
         estado = visao.estado_combate(img)
-        coletar = ossos_ativos.is_set()
+        coletar = ossos_ativos.is_set() and PERFIL.get("osso", True)
         inventario = (
             visao.detectar_ossos_inventario(visao.recortar(img, visao.INVENTARIO))
             if coletar
@@ -885,6 +901,8 @@ def loop_principal():
                 if inventario and ENTERRO.pode():
                     ENTERRO.um(inventario, "loot")
                 esperar_loot(t0)
+            elif estado == "morto" and not PERFIL.get("osso", True) and any(c.ativas() for c in COLETAS):
+                esperar_loot_rotulo(t0)
             continue
 
         # Em combate: não clica em outro alvo; aproveita para enterrar
