@@ -1,0 +1,2 @@
+# O cmd precisa de CRLF nos .bat (goto/:rotulo falham com LF).
+*.bat text eol=crlf

@@ -1,16 +1,22 @@
 """Teste de regressão da detecção, usando as amostras gravadas pelo bot.
 
   python main.py --amostras     # grava frames em amostras/ enquanto joga
-  python testar_visao.py        # confere a detecção contra essas amostras
+  python testar_visao.py        # confere a detecção contra essas amostras (até 4 processos)
+  python testar_visao.py -j 1   # um teste por vez: use com o bot ligado (não rouba CPU dele)
 
 Cada amostra foi rotulada pelo próprio jogo: o bot só grava "sapo_ok"/"osso_ok"
 depois que o texto de ação confirmou o que havia naquela posição. Rode este
 teste sempre que mexer em visao.py ou trocar um template.
 """
+import argparse
+import contextlib
 import glob
+import io
 import json
 import os
 import sys
+import traceback
+from concurrent.futures import ProcessPoolExecutor
 
 import cv2
 import numpy as np
@@ -119,7 +125,8 @@ def testar_cliques():
 def testar_menus():
     """Recortes de menus abertos; "ok" = o bot achou a linha e o osso entrou no inventário."""
     falhas, n = [], 0
-    menus = glob.glob(os.path.join(PASTA, "menus", "*_ok.png")) +         glob.glob(os.path.join(PASTA, "menus", "*_ok_osso.png"))  # antigos sem sufixo + gravados agora
+    menus = glob.glob(os.path.join(PASTA, "menus", "*_ok.png")) + \
+        glob.glob(os.path.join(PASTA, "menus", "*_ok_osso.png"))  # antigos sem sufixo + gravados agora
     for caminho in sorted(menus):
         n += 1
         ponto, score = visao.achar_take_no_menu(cv2.imread(caminho))
@@ -392,7 +399,6 @@ MENUS_COM_ITEM = {
                "153220_015_ok.png": 374, "153350_018_ok.png": 374, "153413_019_ok.png": 398,
                "153436_020_ok.png": 374},
 }
-MENUS_COM_RUNA = MENUS_COM_ITEM["runa"]
 TOLERANCIA_ROTULO = 4
 TOLERANCIA_PILHA = 4
 
@@ -499,7 +505,7 @@ def testar_rotulo_vizinho():
                 reg = img[y0:y0 + rot.shape[0], x0:x0 + rot.shape[1]]
                 reg[tinta] = rot[tinta]
                 n += 1
-                runas = [r for r in visao.detectar_runas_chao(img) if abs(r["rotulo"][1] - 593) <= 6]
+                runas = [r for r in visao.detectar_itens_chao(img, "runa") if abs(r["rotulo"][1] - 593) <= 6]
                 for r in runas:
                     achou += 1
                     if abs(r["pos"][0] - certa[0]) > 12 or abs(r["pos"][1] - certa[1]) > 12:
@@ -542,14 +548,6 @@ def testar_take_acao():
             falhas.append(f"faixas/{nome}: tem_take_acao = {tem}")
     print(f"Take no texto de ação: {n} faixas")
     return falhas
-
-
-def testar_runas_chao():
-    return testar_item_chao("runa")
-
-
-def testar_runas_menu():
-    return testar_item_menu("runa")
 
 
 def testar_rotulo_novo():
@@ -716,6 +714,134 @@ def testar_perfis_aprendidos():
     return falhas
 
 
+def testar_moldes_cruzados():
+    """Moldes aprendidos sem o nível (visao.cortar_nivel): o corte foi feito (molde mais curto
+    que o gravado; "Take Big bones", sem nível, fica inteiro); a faixa de cada monstro passa no
+    próprio molde com outro nível (tudo depois do fim do molde apagado, onde ficam os dígitos);
+    e não passa no molde de outro monstro (um corte curto demais aceitaria)."""
+    falhas, n_faixas, cruzadas = [], 0, []
+    if visao.cortar_nivel(visao.TEXTOS["take"]).shape != visao.TEXTOS["take"].shape:
+        falhas.append("cortar_nivel cortou o molde 'Take Big bones', que não tem nível")
+    perfis, faixas = {}, {}
+    for nome in visao.perfis_disponiveis():
+        p = visao.carregar_perfil(nome)
+        if not p.get("aprendido"):
+            continue
+        perfis[nome] = p
+        with open(os.path.join(visao.PASTA_PERFIS, f"{nome}.json"), encoding="utf-8") as f:
+            molde_arq = json.load(f)["texto"]["molde"]
+        gravado = cv2.imread(os.path.join(visao.PASTA_PERFIS, molde_arq), cv2.IMREAD_GRAYSCALE)
+        tpl = visao.TEXTOS[p["texto"]]
+        if gravado is not None and tpl.shape[1] >= gravado.shape[1]:
+            falhas.append(f"perfis/{nome}: o nível não foi cortado do molde ({gravado.shape[1]} px)")
+        else:  # o último traço do molde cortado é o hífen (até 3 px de altura), não um dígito
+            t = tpl > 100
+            fim = ini = np.flatnonzero(t.any(axis=0))[-1]
+            while ini > 0 and t[:, ini - 1].any():
+                ini -= 1
+            linhas = np.flatnonzero(t[:, ini:fim + 1].any(axis=1))
+            if linhas[-1] - linhas[0] > 2:
+                falhas.append(f"perfis/{nome}: o molde cortado não termina no '-' de \"(level-\"")
+        caminhos = sorted(glob.glob(os.path.join(visao.PASTA_PERFIS, f"{nome}_exemplos", "faixa_*.png")))
+        lidas = [(os.path.basename(c), cv2.imread(c)) for c in caminhos]
+        faixas[nome] = [(arq, f) for arq, f in lidas if f is not None]
+    for a, pa in perfis.items():
+        chave = pa["texto"]
+        tpl, limiar = visao.TEXTOS[chave], visao.limiar_texto(chave)
+        for arq, faixa in faixas[a]:
+            n_faixas += 1
+            # outro nível: apaga a faixa a partir de onde o molde termina nela
+            m = visao.mascara_texto(faixa, chave in visao.TEXTO_NIVEL_QUALQUER_COR)
+            _, _, _, loc = cv2.minMaxLoc(cv2.matchTemplate(m, tpl, cv2.TM_CCOEFF_NORMED))
+            outro = faixa.copy()
+            outro[:, loc[0] + tpl.shape[1]:] = 0
+            s = visao.score_texto(outro, chave)
+            if s < limiar:
+                falhas.append(f"perfis/{a}: {arq} sem os dígitos do nível dá {s:.3f} (limiar {limiar})")
+            for b, pb in perfis.items():
+                if pb["nome"].lower() == pa["nome"].lower():
+                    continue  # o mesmo monstro ensinado duas vezes
+                s = visao.score_texto(faixa, pb["texto"])
+                cruzadas.append(s)
+                if s >= visao.limiar_texto(pb["texto"]):
+                    falhas.append(f"perfis/{a}: {arq} passa no molde de {b} ({s:.3f})")
+    if n_faixas:
+        print(f"Moldes sem o nível: {len(perfis)} perfis, {n_faixas} faixas; outro nível aceito; "
+              f"no molde de outro monstro <= {max(cruzadas, default=0.0):.3f} (limiar "
+              f"{min(visao.limiar_texto(p['texto']) for p in perfis.values())})")
+    else:
+        print(f"Moldes sem o nível: {len(perfis)} perfis; faixas: sem dados (perfis/*_exemplos/)")
+    return falhas
+
+
+# ---------- Monstro pelo nome em ciano ("NPC Highlights") ----------
+# amostras/nomes/<perfil>/: quadros copiados de logs/ com o monstro do perfil, e esperado.json com
+# o centro de cada nome que o bot tem que achar (conferidos a olho; os nomes na faixa do texto
+# de ação, no alto da tela, ficam de fora de propósito).
+TOLERANCIA_NOME = 6  # px
+TOLERANCIA_MIRA_NOME = 3
+
+
+def caixa_mira(pos, raio, img):
+    """O recorte de main.refinar_mira (tela.caixa): centrado em pos, sem sair do quadro."""
+    x = min(max(int(pos[0]), raio), img.shape[1] - raio)
+    y = min(max(int(pos[1]), raio), img.shape[0] - raio)
+    return x - raio, y - raio, x + raio, y + raio
+
+
+def testar_mira_por_nome():
+    """Perfil com o nome do NPC (visao.detectar_por_nome): acha os nomes conferidos e nada a
+    mais (o "Zombie" ao lado não conta); no recorte da correção da mira (main.refinar_mira),
+    visao.sapo_mais_proximo devolve o mesmo ponto; e nos quadros de amostras/ (sem nomes em
+    ciano) não acha nada."""
+    pasta = os.path.join(PASTA, "nomes")
+    gabaritos = sorted(glob.glob(os.path.join(pasta, "*", "esperado.json")))
+    if not gabaritos:
+        print("Monstro pelo nome: sem dados (amostras/nomes/<perfil>/esperado.json)")
+        return []
+    falhas, perfis, n_quadros, n_achados = [], [], 0, 0
+    for caminho in gabaritos:
+        nome = os.path.basename(os.path.dirname(caminho))
+        try:
+            perfil = visao.carregar_perfil(nome)
+        except KeyError:
+            falhas.append(f"nomes/{nome}: o perfil {nome} não existe")
+            continue
+        if perfil.get("nome_npc") is None:
+            falhas.append(f"nomes/{nome}: o perfil não acha o monstro pelo nome")
+            continue
+        perfis.append(perfil)
+        with open(caminho, encoding="utf-8") as f:
+            esperado = json.load(f)
+        for arq, nomes in esperado.items():
+            img = cv2.imread(os.path.join(pasta, nome, arq))
+            if img is None:
+                falhas.append(f"nomes/{nome}/{arq}: imagem não encontrada")
+                continue
+            n_quadros += 1
+            achados = visao.detectar_por_nome(img, perfil)
+            for e in nomes:
+                if not perto(e, [a["nome"] for a in achados], TOLERANCIA_NOME):
+                    falhas.append(f"nomes/{nome}/{arq}: nome em {e} não achado")
+            for a in achados:
+                n_achados += 1
+                if not perto(a["nome"], nomes, TOLERANCIA_NOME):
+                    falhas.append(f"nomes/{nome}/{arq}: nome a mais em {tuple(map(int, a['nome']))}")
+                x1, y1, x2, y2 = caixa_mira(a["pos"], perfil["raio_mira"], img)
+                p, _ = visao.sapo_mais_proximo(img[y1:y2, x1:x2], (a["pos"][0] - x1, a["pos"][1] - y1), perfil)
+                if p is None or not perto((p[0] + x1, p[1] + y1), [a["pos"]], TOLERANCIA_MIRA_NOME):
+                    falhas.append(f"nomes/{nome}/{arq}: a mira em {a['pos']} foi para "
+                                  f"{None if p is None else (p[0] + x1, p[1] + y1)}")
+    frames = frames_jogo(passo=5)
+    for perfil in perfis:
+        for arq, img in frames:
+            if visao.detectar_por_nome(img, perfil):
+                falhas.append(f"{arq}: {perfil['nome']} achado pelo nome num quadro sem nomes em ciano")
+    print(f"Monstro pelo nome: {n_achados} achados em {n_quadros} quadros, mira conferida em cada um; "
+          f"{len(frames)} quadros sem nomes")
+    return falhas
+
+
 # ---------- Geometria da janela ----------
 def testar_geometria():
     """Onde capturar dada a área do jogo na tela (medido: maximizada = (0, 29, 1920, 1121))."""
@@ -744,18 +870,93 @@ def testar_geometria():
     return falhas
 
 
+def testar_mochila_aberta():
+    """visao.mochila_aberta: nos quadros de jogo a aba da mochila está aberta; nos de
+    amostras/abas/ (outra aba aberta, como depois do F9 do ensino), não."""
+    frames = frames_jogo(passo=5)
+    if not frames:
+        return [SEM_FRAMES]
+    falhas = [f"{nome}: a aba da mochila aberta não foi reconhecida"
+              for nome, img in frames if not visao.mochila_aberta(img)]
+    outras = [(os.path.basename(c), cv2.imread(c)) for c in sorted(glob.glob(os.path.join(PASTA, "abas", "*.png")))]
+    outras = [(nome, img) for nome, img in outras if img is not None]
+    for nome, img in outras:
+        if visao.mochila_aberta(img):
+            falhas.append(f"abas/{nome}: outra aba aberta lida como a da mochila")
+    extra = f"{len(outras)} com outra aba" if outras else "com outra aba: sem dados (amostras/abas/)"
+    print(f"Aba da mochila: {len(frames)} quadros com ela aberta, {extra}")
+    return falhas
+
+
+# Na ordem da saída. Cada item: (função, argumentos...).
+TESTES = [
+    (testar_frames,), (testar_faixas,), (testar_cliques,), (testar_menus,),
+    (testar_vida_amostras,), (testar_vida_baixa,), (testar_vida_deslocada,), (testar_vida_cenario,),
+    (testar_vigia_vida,), (testar_geometria,), (testar_mochila_aberta,),
+    *[t for item in visao.ITENS_CHAO for t in ((testar_item_chao, item), (testar_item_menu, item))],
+    (testar_rotulo_vizinho,), (testar_menu_tem_take,), (testar_take_acao,), (testar_rotulo_novo,),
+    (testar_perfis_aprendidos,), (testar_moldes_cruzados,), (testar_mira_por_nome,),
+    (testar_matiz_vermelho,), (testar_reconexao,),
+]
+# Os mais demorados (medido: 10-40 s cada; o resto, poucos segundos) começam primeiro.
+LENTOS = (testar_item_chao, testar_rotulo_novo, testar_vida_cenario, testar_reconexao,
+          testar_matiz_vermelho, testar_vida_amostras)
+THREADS_POR_PROCESSO = 2  # o OpenCV de cada processo usaria todos os núcleos
+
+
+def _args():
+    p = argparse.ArgumentParser(description="Confere a detecção (visao.py) contra as amostras "
+                                            "gravadas pelo bot em amostras/.")
+    padrao = min(4, os.cpu_count() or 1)
+    p.add_argument("-j", type=int, default=padrao, metavar="N",
+                   help=f"testes em N processos ao mesmo tempo (padrão: {padrao}); "
+                        "com o bot ligado, use -j 1")
+    a = p.parse_args()
+    if a.j < 1:
+        p.error("-j precisa ser 1 ou mais")
+    return a
+
+
+def _iniciar_processo():
+    cv2.setNumThreads(THREADS_POR_PROCESSO)
+
+
+def _rodar(teste):
+    """Roda um teste num processo à parte guardando o que ele imprime: (texto, falhas)."""
+    fn, *args = teste
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            falhas = fn(*args)
+        except Exception:  # um teste que quebra não derruba os outros
+            print(traceback.format_exc(), end="")
+            falhas = [f"{fn.__name__}({', '.join(map(repr, args))}): o teste quebrou (erro acima)"]
+    return buf.getvalue(), falhas
+
+
+def rodar_testes(testes, j):
+    """Roda `testes` em j processos e devolve as falhas. A saída sai na ordem de `testes`;
+    com j = 1, um teste por vez, imprimindo na hora (como antes)."""
+    falhas = []
+    if j == 1:
+        for fn, *args in testes:
+            falhas += fn(*args)
+        return falhas
+    ordem = sorted(testes, key=lambda t: LENTOS.index(t[0]) if t[0] in LENTOS else len(LENTOS))
+    with ProcessPoolExecutor(j, initializer=_iniciar_processo) as ex:
+        futuros = {t: ex.submit(_rodar, t) for t in ordem}
+        for t in testes:
+            texto, f = futuros[t].result()
+            print(texto, end="", flush=True)
+            falhas += f
+    return falhas
+
+
 if __name__ == "__main__":
+    ARGS = _args()
     if not os.path.isdir(PASTA):
         sys.exit("Sem amostras: rode `python main.py --amostras` primeiro.")
-    falhas = testar_frames() + testar_faixas() + testar_cliques() + testar_menus()
-    falhas += testar_vida_amostras() + testar_vida_baixa() + testar_vida_deslocada()
-    falhas += testar_vida_cenario()
-    falhas += testar_vigia_vida() + testar_geometria()
-    for item in visao.ITENS_CHAO:
-        falhas += testar_item_chao(item) + testar_item_menu(item)
-    falhas += testar_rotulo_vizinho() + testar_menu_tem_take() + testar_take_acao()
-    falhas += testar_rotulo_novo() + testar_perfis_aprendidos() + testar_matiz_vermelho()
-    falhas += testar_reconexao()
+    falhas = rodar_testes(TESTES, ARGS.j)
     if falhas:
         print(f"\n{len(falhas)} divergência(s):")
         for f in falhas:

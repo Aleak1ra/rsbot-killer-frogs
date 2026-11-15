@@ -1,19 +1,18 @@
-"""Bot de Giant frog para o cliente oficial do Old School RuneScape.
+"""Bot de combate para o cliente oficial do Old School RuneScape.
 
-Uso:  python main.py [--monstro sapo|hillgiant] [--sem-vida] [--sem-runas] [--sem-moedas] [--amostras]
-  --monstro   qual monstro caçar (padrão: sapo = Giant frog)
-  --sem-vida  desliga a pausa por vida baixa
-  --sem-runas não pega as runas que caem no chão
-  --sem-moedas não pega as moedas (Coins) que caem no chão
-  --amostras  salva frames rotulados em amostras/ (para testar_visao.py)
+Passo a passo (instalar, preparar o jogo, ensinar um monstro, parar): README.md
+Uso:  python main.py            (ou dois cliques em "Iniciar bot.bat")
+      python main.py -h         (lista as opções: --monstro, --reaprender, --sem-runas, ...)
 
 Cada sessão grava um log de eventos em logs/sessao_*.jsonl; use
 `python analisar_log.py` para ver os tempos medidos.
 """
+import argparse
 import ctypes
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -22,40 +21,294 @@ import cv2
 import keyboard
 import numpy as np
 import pyautogui
-from mss import mss
 
 import reconexao
-import tela
 import visao
 
-# Perfil do monstro: python main.py --monstro hillgiant
-NOME_PERFIL = sys.argv[sys.argv.index("--monstro") + 1] if "--monstro" in sys.argv else "sapo"
-try:  # embutido (visao.PERFIS) ou aprendido com ensinar.py (perfis/<nome>.json)
-    PERFIL = visao.carregar_perfil(NOME_PERFIL)
-except KeyError:
-    sys.exit(f"Monstro desconhecido: {NOME_PERFIL}. Opções: {', '.join(visao.perfis_disponiveis())}")
+
+def _args():
+    p = argparse.ArgumentParser(
+        allow_abbrev=False,  # '--sem-runa' dá erro em vez de virar --sem-runas calado
+        description="Bot de combate do Old School RuneScape (cliente oficial, janela maximizada).",
+        epilog="Sem --monstro: reconhece na tela um monstro já aprendido (pelo nome em ciano) ou pede "
+               "o mouse em cima dele + F9 e aprende na hora (perfis/monstro_N.json). Com 'NPC "
+               "Highlights' ligado no jogo (nome dos NPCs em ciano) o bot acha o monstro pelo nome, "
+               "com muito mais precisão. F8 liga/desliga os ossos. Para parar: Ctrl+C no terminal (o "
+               "mouse num canto da tela também para, mas só enquanto o bot mexe o mouse).")
+    p.add_argument("--monstro", metavar="NOME",
+                   help='o monstro a caçar, ex.: --monstro "Moss giant" (embutidos: sapo = Giant frog, '
+                        "hillgiant); se for novo, aprende com F9")
+    p.add_argument("--reaprender", action="store_true",
+                   help="ensina de novo o monstro (F9), por cima do que já sabia")
+    p.add_argument("--sem-vida", action="store_true",
+                   help="desliga a pausa por vida baixa e também a conferência da interface na tela "
+                        "e a volta automática ao jogo (só se o orbe de vida não aparecer)")
+    p.add_argument("--sem-runas", action="store_true", help="não pega as runas que caem no chão")
+    p.add_argument("--sem-moedas", action="store_true", help="não pega as moedas (Coins) do chão")
+    p.add_argument("--amostras", action="store_true",
+                   help="salva quadros em amostras/ para o testar_visao.py")
+    a = p.parse_args()
+    if a.monstro is not None and not re.search(r"[a-z0-9]", a.monstro.lower()):  # = nome_arquivo
+        p.error(f"--monstro {a.monstro!r}: o nome precisa de pelo menos uma letra ou número")
+    return a
+
+
+ARGS = _args()  # antes de importar tela.py, que encerra sem o jogo aberto: o -h funciona sem ele
+
+import tela  # noqa: E402
+from tela import (  # noqa: E402
+    CLIQUE_TIMEOUT,
+    HOVER_ATRASO_MIN,
+    HOVER_TIMEOUT,
+    PONTO_NEUTRO,
+    TEMPO_MOUSE_PARADO,
+)
+
+EMBUTIDOS = set(visao.PERFIS)  # sapo, hillgiant (carregar_perfil acrescenta os aprendidos em visao.PERFIS)
+
+
+def nome_do_perfil(texto):
+    """'Moss giant' -> 'moss_giant' (arquivo perfis/<nome>.json). Sem '_' também vale (o
+    embutido hillgiant para 'hill_giant'; um perfil ensinado com o nome sem '_') e o nome do
+    jogo de um embutido ('Giant frog' -> sapo)."""
+    nome = visao.nome_arquivo(texto)  # nunca vazio: _args() já recusou o nome sem letra/número
+    disponiveis = visao.perfis_disponiveis()
+    if nome in disponiveis:
+        return nome
+    if nome.replace("_", "") in disponiveis:
+        return nome.replace("_", "")
+    for n in EMBUTIDOS:
+        if visao.PERFIS[n]["nome"].lower() == texto.strip().lower():
+            return n
+    return nome
+
+
+def recusar_f9(motivo):
+    """Bipe de erro e o motivo de um F9 recusado (com a dica se o jogo não estiver na frente)."""
+    tela.bip("erro")
+    print(f"   ❌ {tela.com_dica_de_foco(motivo)}. Tente de novo (F9).")
+
+
+def ler_f9(timeout=None):
+    """Espera o F9 (até `timeout` s, se dado) e lê a tela e o mouse na hora do aperto:
+    (img, pos), ou None (tempo esgotado, ou o jogo fora do lugar: motivo impresso)."""
+    leitura = tela.ler_f9(timeout)
+    if leitura is None:
+        return None
+    img, pos, problema = leitura
+    if problema:
+        recusar_f9(problema)
+        return None
+    return img, pos
+
+
+def ler_f9_valido():
+    """F9 até o mouse estar sobre um monstro: texto de ação "Attack ..." e ponto dentro do jogo.
+    Devolve (img, pos); motivo da recusa impresso (e um bipe)."""
+    import ensino
+
+    while True:
+        leitura = ler_f9()
+        if leitura is None:
+            continue
+        img, pos = leitura
+        if not visao.dentro_do_jogo(pos) or visao.na_interface(pos):
+            motivo = "o mouse está fora da área do jogo"
+        else:
+            motivo = ensino.gerar_molde_texto(visao.recortar(img, visao.FAIXA_TEXTO_ACAO))[1]
+        if motivo is None:
+            return leitura
+        recusar_f9(motivo)
+
+
+def aprender(nome, nome_jogo, primeiro=None, osso="Big bones", espera_loot=4.5):
+    """Ensina o monstro com o mouse em cima dele + F9 (ensino.Ensino: com o nome do NPC em
+    ciano na tela, pelo nome; senão, pela cor), grava perfis/<nome>.json e devolve o perfil.
+    `primeiro`: (img, pos) de um F9 já lido. Repete o F9 até um exemplo servir; Ctrl+C sai."""
+    import ensino
+
+    e = ensino.Ensino(nome, nome_jogo, espera_loot, osso=osso)
+    leitura = primeiro
+    while True:
+        if leitura is None:
+            leitura = ler_f9()
+            if leitura is None:
+                continue
+        img, pos = leitura
+        leitura = None
+        try:
+            msg = e.adicionar(img, pos, visao.recortar(img, visao.FAIXA_TEXTO_ACAO))
+        except Exception as erro:  # um aperto ruim não pode derrubar o bot
+            msg = f"exemplo recusado: erro ao aprender ({erro!r})"
+        if e.perfil is not None and not msg.startswith("exemplo recusado") and not e.perfil.get("nome_npc"):
+            # pela cor, 1 exemplo: tem que achar o próprio monstro no quadro do F9
+            if not e.acha(img, pos):
+                e.desfazer()
+                msg = ("exemplo recusado: pela cor, não achei esse monstro (ponha o mouse no meio do "
+                       "corpo, ou ligue 'NPC Highlights' no jogo)")
+        if e.perfil is None or msg.startswith("exemplo recusado"):
+            recusar_f9(msg.replace("exemplo recusado: ", ""))
+            continue
+        break
+    caminho = e.salvar()
+    e.conferir()
+    tela.bip("ok")
+    n = len(visao.detectar_sapos(img, e.perfil_visao()))
+    if e.perfil.get("nome_npc"):
+        print(f"   ✅ Aprendi pelo nome em ciano: {n} na tela agora. Perfil: {caminho}")
+    else:
+        print(f"   ✅ Aprendi pela cor do corpo ({n} candidato(s) na tela). Perfil: {caminho}")
+        print("   ⚠️ Pela cor o bot pode passar o mouse em coisas do cenário da mesma cor; com "
+              "'NPC Highlights' ligado no jogo ele acha o monstro pelo nome.")
+    visao.PERFIS.pop(nome, None)  # perfis_conhecidos() pode ter guardado o perfil antigo
+    return visao.carregar_perfil(nome)
+
+
+def opcoes_antigas(nome):
+    """(osso, espera_loot) de perfis/<nome>.json, para reaprender sem perder o que foi ajustado."""
+    try:
+        with open(os.path.join(visao.PASTA_PERFIS, f"{nome}.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("osso", "Big bones"), float(d.get("espera_loot", 4.5))
+    except (OSError, ValueError):
+        return "Big bones", 4.5
+
+
+def perfis_conhecidos():
+    """[(nome, perfil)] de todos os perfis que carregam sem erro (embutidos e aprendidos)."""
+    lista = []
+    for nome in visao.perfis_disponiveis():
+        try:
+            lista.append((nome, visao.carregar_perfil(nome)))
+        except (KeyError, ValueError):
+            pass
+    return lista
+
+
+def monstro_da_tela(img):
+    """(nome, perfil) do monstro aprendido pelo nome em ciano com mais exemplares em `img`, ou
+    None. Os perfis pela cor não entram: a cor sozinha não diz qual monstro é."""
+    melhor = None
+    for nome, p in perfis_conhecidos():
+        if p.get("nome_npc") is None:
+            continue
+        n = len(visao.detectar_por_nome(img, p))
+        if n and (melhor is None or n > melhor[0]):
+            melhor = (n, nome, p)
+    return None if melhor is None else melhor[1:]
+
+
+def monstro_do_mouse(img):
+    """(nome, perfil) cujo texto de ação ("Attack <Nome>") bate com o da tela agora, ou None."""
+    faixa = visao.recortar(img, visao.FAIXA_TEXTO_ACAO)
+    batem = [(nome, p) for nome, p in perfis_conhecidos()
+             if visao.score_texto(faixa, p["texto"]) >= visao.limiar_texto(p["texto"])]
+    if not batem:
+        return None
+
+    # mais de um perfil do mesmo monstro (ex.: um antigo pela cor): o pelo nome que acha o
+    # monstro agora (sem "NPC Highlights" ele não acharia nada), depois o embutido, o mais novo
+    def chave(item):
+        nome, p = item
+        arq = os.path.join(visao.PASTA_PERFIS, f"{nome}.json")
+        pelo_nome = p.get("nome_npc") is not None and bool(visao.detectar_por_nome(img, p))
+        return (pelo_nome, nome in EMBUTIDOS, os.path.getmtime(arq) if os.path.isfile(arq) else 0.0)
+    return max(batem, key=chave)
+
+
+def nome_livre():
+    """monstro_1, monstro_2, ...: o primeiro sem perfil (o bot não lê o nome do monstro)."""
+    n = 1
+    while f"monstro_{n}" in visao.perfis_disponiveis():
+        n += 1
+    return f"monstro_{n}"
+
+
+TROCAR_SEG = 6  # s para apertar F9 em outro monstro depois de reconhecer um na tela
+
+
+def escolher_monstro(reaprender=False):
+    """Sem --monstro: reconhece na tela um monstro já aprendido (pelo nome em ciano) e dá
+    TROCAR_SEG s para um F9 em outro; se não reconhecer, pede o mouse em cima do monstro + F9 e
+    usa o perfil que já bate com ele ou aprende um novo. `reaprender`: sempre pelo F9, e o
+    monstro do mouse é ensinado de novo."""
+    print("\n👉 Vou olhar a tela do jogo. Se eu pedir, ponha o mouse em cima do monstro que quer "
+          "caçar e aperte F9 (vai ouvir um bipe). Ctrl+C sai.")
+    print("   Dica: ligue 'NPC Highlights' no jogo (nome dos NPCs em ciano): o bot reconhece e acha "
+          "o monstro pelo nome, com muito mais precisão.")
+    time.sleep(2)
+    tela.trazer_para_frente()
+    time.sleep(0.5)
+    leitura = None
+    if not reaprender:
+        achado = monstro_da_tela(tela.capturar())
+        if achado:
+            print(f"🎯 Reconheci {achado[1]['nome']} na tela (perfil {achado[0]}). Para caçar OUTRO, "
+                  f"ponha o mouse nele e aperte F9 nos próximos {TROCAR_SEG} s.")
+            tela.bip("pergunta")
+            leitura = ler_f9(TROCAR_SEG)
+            if leitura is None:
+                return achado
+    if leitura is None:
+        tela.bip("pergunta")
+        print("👉 Ponha o mouse em cima do monstro que quer caçar e aperte F9.")
+        leitura = ler_f9_valido()
+    conhecido = monstro_do_mouse(leitura[0])
+    if conhecido and not (reaprender and conhecido[0] not in EMBUTIDOS):
+        tela.bip("ok")
+        print(f"🎯 Esse eu já conheço: {conhecido[1]['nome']} (perfil {conhecido[0]}).")
+        return conhecido
+    if conhecido:
+        nome, nome_jogo = conhecido[0], conhecido[1]["nome"]
+        osso, espera = opcoes_antigas(nome)
+    else:
+        nome = nome_livre()
+        nome_jogo = nome.replace("_", " ").capitalize()
+        osso, espera = "Big bones", 4.5
+    print(f"🆕 {'Reaprendendo' if conhecido else 'Monstro novo'}: perfil {nome}.")
+    return nome, aprender(nome, nome_jogo, primeiro=leitura, osso=osso, espera_loot=espera)
+
+
+# Perfil do monstro: python main.py  (reconhece na tela ou pergunta com F9)
+#                    python main.py --monstro "Moss giant"  (esse; se novo, aprende na hora)
+REAPRENDER = ARGS.reaprender
+ARG_MONSTRO = ARGS.monstro  # None: escolher_monstro
+try:
+    if ARG_MONSTRO is None:
+        NOME_PERFIL, PERFIL = escolher_monstro(REAPRENDER)
+    else:
+        NOME_PERFIL = nome_do_perfil(ARG_MONSTRO)
+        if NOME_PERFIL in EMBUTIDOS or (not REAPRENDER and NOME_PERFIL in visao.perfis_disponiveis()):
+            PERFIL = visao.carregar_perfil(NOME_PERFIL)
+        else:
+            print(f"\n🆕 Ainda não conheço o monstro '{ARG_MONSTRO}'. Ponha o mouse em cima de um "
+                  f"(o canto de cima mostra 'Attack ...') e aperte F9 (vai ouvir um bipe).")
+            time.sleep(2)  # dá tempo de ler antes de o jogo vir para a frente
+            tela.trazer_para_frente()
+            tela.bip("pergunta")
+            osso, espera = opcoes_antigas(NOME_PERFIL)
+            PERFIL = aprender(NOME_PERFIL, ARG_MONSTRO if ARG_MONSTRO != NOME_PERFIL
+                              else NOME_PERFIL.replace("_", " ").capitalize(), osso=osso, espera_loot=espera)
+except KeyboardInterrupt:
+    sys.exit("\nSaindo.")
 except ValueError as erro:  # perfis/<nome>.json existe mas está incompleto ou estragado
-    sys.exit(f"Perfil {NOME_PERFIL} com problema: {erro}")
+    monstro = f'--monstro "{ARG_MONSTRO}" ' if ARG_MONSTRO else ""
+    sys.exit(f"Perfil com problema: {erro}\nEnsine de novo: python main.py {monstro}--reaprender")
 
 # ========== Configurações ==========
-TITULO_JANELA = "Old School RuneScape"
-
+# Em tela.py (as mesmas do yew.py): TEMPO_MOUSE_PARADO, os tempos do texto de ação ao passar o
+# mouse (HOVER_ATRASO_MIN, HOVER_TIMEOUT), o do X de clique (CLIQUE_TIMEOUT) e PONTO_NEUTRO.
 DELAY_CICLO = 0.05
-TEMPO_MOUSE_PARADO = 1.0  # pausa quando VOCÊ mexe o mouse
-
-# Texto de ação ao passar o mouse
-HOVER_ATRASO_MIN = 0.06  # ignora leituras antes disso (texto antigo ainda na tela)
-HOVER_TIMEOUT = 0.25  # medido: o texto certo aparece em ~0,09 s
 MAX_TENTATIVAS_SAPO = 4
 # Mira: antes de clicar, relocaliza o sapo num recorte em volta do mouse
 RAIO_MIRA = PERFIL["raio_mira"]
 MIRA_DESLOC_MIN = 4  # px; abaixo disso não vale mexer o mouse
+# px; acima disso o "mais perto" da mira é outro monstro (o recorte do perfil pelo nome é largo):
+# não troca o alvo que o texto de ação confirmou
+MIRA_DESLOC_MAX = 60
 # Sapo com barra de vida sobre a cabeça já está lutando com outro jogador.
 # Medido: 8 de 9 ataques que falharam tinham >= 36 px de barra; os 47 que deram certo, 0.
 BARRA_SAPO_OCUPADO = 25
-
-# X de clique: aparece ~40 ms depois do clique e dura ~300 ms
-CLIQUE_TIMEOUT = 0.25
 
 # Menu de botão direito (pilhas de itens): meia largura/altura da área lida em volta do clique
 MENU_RAIO = (280, 330)
@@ -69,17 +322,27 @@ VIDA_TENTATIVAS_CONFIRMAR = 8  # quadros novos (~0,5 s) para confirmar uma leitu
 ESPERA_TELA_ASSENTAR = 0.5  # s depois do jogo voltar ao foco/à janela certa
 VIDA_AVISO_SEM_LEITURA = 60  # s jogando sem conseguir ler o orbe -> avisa no terminal
 VIDA_AVISO_PAUSADO = 20  # idem, com o bot pausado esperando a vida voltar
-SEM_VIDA = "--sem-vida" in sys.argv
+SEM_VIDA = ARGS.sem_vida
 
 # Combate
 ESPERA_INICIO_COMBATE = 5.0  # medido em 120 ataques: 1,5 s típico, 4,25 s no pior caso
+# Recorte do canto com o painel do oponente: a espera do combate lê só ele (~10x mais rápido que
+# a janela inteira); começa em (0, 0), então as posições de visao.PAINEL_OPONENTE valem nele
+PAINEL = (0, 0, visao.PAINEL_OPONENTE[2], visao.PAINEL_OPONENTE[3])
 ESPERA_LOOT = PERFIL["espera_loot"]  # tempo para o osso aparecer depois da barra zerar
 RAIO_LOOT = 320  # px em volta do personagem
 LOOT_ROTULO_MIN = 1.0  # s: perfil sem osso só aceita o loot depois disso (medido: cai em 1,8-3,1 s)
+# Perfil com osso, monstro que não larga Big bones: o loot inteiro cai de uma vez; rótulo novo
+# sem Big bones por isso -> não vai ter osso, não espera o resto do ESPERA_LOOT
+LOOT_SEM_OSSO_SEG = 0.4
+# ...mas nunca antes disso da morte: um rótulo que não é do loot (item de outro jogador)
+# encerraria cedo e o osso, que cai em ~2,95 s (p90 3,03 s, 946 mortes de Hill Giant), ficaria
+LOOT_SEM_OSSO_MIN = 3.2
+ABA_INTERVALO = 5.0  # s entre cliques na aba da mochila (garantir_mochila)
 
 # Itens do chão pegos antes dos ossos: runas e moedas (--sem-runas / --sem-moedas desligam)
-PEGAR_RUNAS = "--sem-runas" not in sys.argv
-PEGAR_MOEDAS = "--sem-moedas" not in sys.argv
+PEGAR_RUNAS = not ARGS.sem_runas
+PEGAR_MOEDAS = not ARGS.sem_moedas
 ESPERA_PEGAR_ITEM = 2.5  # + dist/150, como os ossos
 # Distância do loot (runas, moedas e ossos): o das próprias lutas cai perto (ossos: 95% a
 # <= 271 px; runas e moedas <= 122 px). O que está longe costuma ser de outros jogadores e
@@ -99,7 +362,6 @@ COLETA_PAUSA = 30.0
 INVENTARIO_DIF_TOM = 40
 INVENTARIO_DIF_PX = 6
 INVENTARIO_ESPERA_MIN = 0.25  # s após o clique antes de aceitar a mudança (filtra as passageiras)
-INVENTARIO_RAPIDA = 0.4  # coleta confirmada antes disso grava o inventário antes|depois (diagnóstico)
 # Depois de pegar um item, o rótulo da pilha ainda aparece por um instante, entre onde ela estava
 # na tela e o personagem (a câmera ainda alcançando). Visto em 15/11: 3 mira_perdida e 2 menus
 # sem o item (contados como falha, um com 3,2 s de procura) logo após pegar runa/moedas. Por esse
@@ -114,23 +376,28 @@ PROCURA_TAKE = [(0, 22), (12, 0), (-12, 0), (0, 10), (12, 22), (-12, 22), (24, 0
 MIRA_RAIO_X, MIRA_ACIMA, MIRA_ABAIXO = 260, 230, 90
 MIRA_PARADO_PX = 3
 MIRA_LONGA = (1.5, 80)  # s, px: até isso depois de uma coleta mais longe que isso, mira com 2 leituras
+# Visto com Skeleton (15/11): o painel do oponente sumiu ~1,3 s no meio da luta e voltou; o bot
+# dava a luta por encerrada e saía passando o mouse em outros. Sem painel ("livre") só encerra
+# a luta depois disso (o fim normal é "morto", que não espera).
+COMBATE_LIVRE_SEG = 1.5
+MAX_FOTOS_DIAG = 10  # por tipo e por sessão: logs/combate_livre/, logs/texto_quase/, *_osso_menu
+TEXTO_QUASE = 0.15  # hover recusado com nota até isso abaixo do limiar: guarda a faixa
 MIRA_TIMEOUT = 1.0
+# s: quadro do ciclo mais velho que isso na hora de atacar (coleta que falhou pelo menu, ~3,9 s)
+# é renovado. Visto em 14-15/11: 1º hover aceito em 96% com quadro de até 0,5 s; 33% com >= 1 s
+QUADRO_VELHO_SEG = 0.5
 COLETA_MAX_FOTOS = 40  # fotos de falha por sessão (logs/coleta_falhas/)
 
 # Ossos
 ESPERA_PEGAR_OSSO = 2.5  # medido em 48 coletas: 1,2 s típico, 1,6 s no pior caso
 INTERVALO_ENTERRAR = 1.3  # o jogo ignora cliques de enterrar mais rápidos que ~2 ticks
 MIN_OSSOS_ENTERRAR = 10  # fora de combate só enterra se acumular isso
-# Onde o mouse descansa depois de clicar no inventário (coluna de pedra, sem tooltip)
-PONTO_NEUTRO = (1593, 960)
 # O jogo desconecta depois de 5 min sem mouse/teclado (visto às 03:32 de 15/11, numa pausa
 # por vida baixa). Parado (pausa por vida), o bot mexe o mouse na coluna de pedra e toca o
 # Shift a cada intervalo sorteado entre esses valores (s), sem clicar em nada.
 ANTI_AFK_SEG = (60.0, 120.0)
 
-pyautogui.PAUSE = 0.03
-
-SALVAR_AMOSTRAS = "--amostras" in sys.argv
+SALVAR_AMOSTRAS = ARGS.amostras
 MAX_AMOSTRAS_POR_CLASSE = 8
 MAX_FAIXAS = 120
 
@@ -148,26 +415,7 @@ CENTRO = (tela.LARGURA // 2, tela.ALTURA // 2)
 
 
 # ========== Registro de eventos ==========
-class Registro:
-    def __init__(self):
-        pasta = os.path.join(visao.BASE_DIR, "logs")
-        os.makedirs(pasta, exist_ok=True)
-        self.caminho = os.path.join(pasta, time.strftime("sessao_%Y%m%d_%H%M%S.jsonl"))
-        self.arquivo = open(self.caminho, "a", encoding="utf-8")
-        self.t0 = time.time()
-        self.trava = threading.Lock()
-
-    def ev(self, nome, **dados):
-        linha = {"t": round(time.time() - self.t0, 3), "ev": nome, **dados}
-        with self.trava:
-            self.arquivo.write(
-                json.dumps(linha, default=lambda o: o.item() if hasattr(o, "item") else str(o))
-                + "\n"
-            )
-            self.arquivo.flush()
-
-
-LOG = Registro()
+LOG = tela.Registro()  # logs/sessao_*.jsonl
 _amostras = {}
 
 
@@ -195,6 +443,19 @@ def salvar_faixa(faixa, rotulo, scores):
     cv2.imwrite(os.path.join(pasta, f"{n:03d}_{rotulo}_{partes}.png"), faixa)
 
 
+def foto_diagnostico(tipo, img, sufixo=""):
+    """logs/<tipo>/HHMMSS_mmm<sufixo>.png, no máximo MAX_FOTOS_DIAG por tipo na sessão (sempre,
+    sem --amostras)."""
+    if img is None or _amostras.get(f"diag_{tipo}", 0) >= MAX_FOTOS_DIAG:
+        return None
+    _amostras[f"diag_{tipo}"] = _amostras.get(f"diag_{tipo}", 0) + 1
+    pasta = os.path.join(visao.BASE_DIR, "logs", tipo)
+    os.makedirs(pasta, exist_ok=True)
+    nome = f"{time.strftime('%H%M%S')}_{int(time.time() * 1000) % 1000:03d}{sufixo}.png"
+    cv2.imwrite(os.path.join(pasta, nome), img)
+    return nome
+
+
 def salvar_clique(antes, depois, tipo):
     """Guarda a região do clique antes/depois (lado a lado) para testar_visao.py."""
     if not SALVAR_AMOSTRAS or _amostras.get("clique", 0) >= MAX_FAIXAS:
@@ -207,26 +468,7 @@ def salvar_clique(antes, depois, tipo):
 
 
 # ========== Tela e mouse ==========
-_local = threading.local()
-
-
-def capturar(regiao=None):
-    """Captura a janela inteira ou só uma região (x1, y1, x2, y2) dela."""
-    if not hasattr(_local, "sct"):
-        _local.sct = mss()
-    if regiao is None:
-        area = CAPTURE_REGION
-    else:
-        x1, y1, x2, y2 = regiao
-        area = {
-            "left": CAPTURE_REGION["left"] + x1,
-            "top": CAPTURE_REGION["top"] + y1,
-            "width": x2 - x1,
-            "height": y2 - y1,
-        }
-    return cv2.cvtColor(np.array(_local.sct.grab(area)), cv2.COLOR_BGRA2BGR)
-
-
+capturar = tela.capturar  # janela inteira ou uma região (x1, y1, x2, y2) dela
 jogo_em_foco = tela.jogo_em_foco  # segue a janela ativa do jogo (ver tela.py)
 AVISO_INATIVO_SEG = 240  # fora de foco e sem entrada há isso: o jogo desconecta em ~1 min
 
@@ -290,6 +532,44 @@ def clicar_em(pos):
 
 
 
+_aba = {"t": 0.0}
+
+
+def garantir_mochila(img):
+    """Abre a aba da mochila se outra estiver aberta (as teclas F9/F7/F10 do ensino trocam a aba
+    no jogo; sem a mochila o bot não vê os ossos nem confere as coletas). No máximo a cada
+    ABA_INTERVALO s. True se clicou (o quadro do ciclo ficou velho)."""
+    if visao.mochila_aberta(img) or time.time() - _aba["t"] < ABA_INTERVALO:
+        return False
+    _aba["t"] = time.time()
+    x1, y1, x2, y2 = visao.ABA_MOCHILA
+    LOG.ev("aba_mochila")
+    clicar_em(((x1 + x2) // 2, (y1 + y2) // 2))
+    mover(PONTO_NEUTRO)  # a dica do jogo sobre a aba cobriria o topo da mochila
+    time.sleep(0.3)
+    return True
+
+
+SEM_NOMES_AVISO_SEG = 30
+_sem_nomes = {"desde": None, "avisou": False}
+
+
+def avisar_sem_nomes(img):
+    """Perfil pelo nome e nenhum nome de NPC em ciano na tela há SEM_NOMES_AVISO_SEG: avisa uma
+    vez ("NPC Highlights" desligado; o bot segue pela cor de reserva, se o perfil tiver)."""
+    if visao.ha_nomes_npc(img):
+        _sem_nomes["desde"] = None
+        return
+    agora = time.time()
+    if _sem_nomes["desde"] is None:
+        _sem_nomes["desde"] = agora
+    elif not _sem_nomes["avisou"] and agora - _sem_nomes["desde"] > SEM_NOMES_AVISO_SEG:
+        _sem_nomes["avisou"] = True
+        LOG.ev("sem_nomes_npc", seg=SEM_NOMES_AVISO_SEG)
+        print(f"\n⚠️ Não vejo nomes de NPC em ciano há {SEM_NOMES_AVISO_SEG} s: o 'NPC Highlights' "
+              "está ligado no jogo? Sem ele o bot procura pela cor do corpo, bem menos precisa.")
+
+
 RECONEXAO = reconexao.Reconexao(clicar_em, LOG.ev)
 VIGIA_VIDA = visao.VigiaVida(VIDA_MINIMA, VIDA_RETOMAR, VIDA_CONFIRMACOES)
 
@@ -317,10 +597,7 @@ def clicar_conferindo(pos, classe):
     Um X amarelo significa que o alvo saiu de baixo do mouse e o clique virou
     "Walk here": dá para desistir na hora em vez de esperar o timeout.
     """
-    r = visao.CLIQUE_RAIO
-    x = min(max(int(pos[0]), r), CAPTURE_REGION["width"] - r)
-    y = min(max(int(pos[1]), r), CAPTURE_REGION["height"] - r)
-    regiao = (x - r, y - r, x + r, y + r)
+    regiao = tela.caixa(pos, visao.CLIQUE_RAIO)
     antes = capturar(regiao)
     if not clicar():
         return "cancelado"
@@ -338,20 +615,16 @@ def clicar_conferindo(pos, classe):
 
 def refinar_mira(pos):
     """Posição atual do sapo que estava em `pos` e quanto ele andou (px)."""
-    x = min(max(int(pos[0]), RAIO_MIRA), CAPTURE_REGION["width"] - RAIO_MIRA)
-    y = min(max(int(pos[1]), RAIO_MIRA), CAPTURE_REGION["height"] - RAIO_MIRA)
-    local = capturar((x - RAIO_MIRA, y - RAIO_MIRA, x + RAIO_MIRA, y + RAIO_MIRA))
-    achado, _ = visao.sapo_mais_proximo(
-        local, (pos[0] - x + RAIO_MIRA, pos[1] - y + RAIO_MIRA), PERFIL
-    )
+    reg = tela.caixa(pos, RAIO_MIRA)
+    x1, y1 = reg[:2]
+    achado, _ = visao.sapo_mais_proximo(capturar(reg), (pos[0] - x1, pos[1] - y1), PERFIL)
     if achado is None:
         return pos, None
-    novo = (x - RAIO_MIRA + achado[0], y - RAIO_MIRA + achado[1])
+    novo = (x1 + achado[0], y1 + achado[1])
     return novo, distancia(pos, novo)
 
 
-def distancia(p1, p2):
-    return float(np.linalg.norm(np.subtract(p1, p2)))
+distancia = tela.distancia
 
 
 def dist_segmento(p, a, b):
@@ -363,49 +636,14 @@ def dist_segmento(p, a, b):
 
 
 # ========== Leituras com espera ==========
-def esperar_texto(chaves, timeout=HOVER_TIMEOUT):
-    """Depois de mover o mouse, espera o texto de ação virar um dos `chaves`.
-
-    Devolve (chave ou None, latência em s, {chave: maior score visto}, última faixa).
-    Exige duas leituras seguidas iguais para não clicar com texto de passagem.
-    """
-    inicio = time.perf_counter()
-    melhores = {c: 0.0 for c in chaves}
-    anterior = None
-    faixa = None
-    while True:
-        dt = time.perf_counter() - inicio
-        if dt > timeout:
-            return None, dt, melhores, faixa
-        if dt < HOVER_ATRASO_MIN:
-            time.sleep(0.01)
-            continue
-        faixa = capturar(visao.FAIXA_TEXTO_ACAO)
-        achou = None
-        for c in chaves:
-            s = visao.score_texto(faixa, c)
-            melhores[c] = max(melhores[c], s)
-            if achou is None and s >= visao.limiar_texto(c):
-                achou = c
-        if achou is not None and achou == anterior:
-            return achou, dt, melhores, faixa
-        anterior = achou
-        time.sleep(0.01)
+# esperar_texto devolve (chave ou None, latência, {chave: maior score}, última faixa);
+# esperar devolve (ok, tempo decorrido). Ver tela.py.
+esperar_texto = tela.esperar_texto
+esperar = tela.esperar
 
 
 def contar_ossos_inventario():
     return visao.detectar_ossos_inventario(capturar(visao.INVENTARIO))
-
-
-def esperar(condicao, timeout, intervalo=0.05):
-    """Espera `condicao()` ficar verdadeira. Devolve (ok, tempo decorrido)."""
-    inicio = time.perf_counter()
-    while True:
-        if condicao():
-            return True, time.perf_counter() - inicio
-        if time.perf_counter() - inicio > timeout:
-            return False, time.perf_counter() - inicio
-        time.sleep(intervalo)
 
 
 # ========== Ações ==========
@@ -569,22 +807,6 @@ def mirar_parado(pos, detectar_local):
     return None
 
 
-def foto_menu_osso():
-    """Diagnóstico: grava o último menu de osso que falhou (logs/coleta_falhas/, até 10 por
-    sessão). Visto em 15/11: 8 de 544 menus de osso recusados sempre com nota ~0,901."""
-    global _fotos_menu_osso
-    rec = _ultimo_menu["rec"]
-    if rec is None or _fotos_menu_osso >= 10:
-        return
-    _fotos_menu_osso += 1
-    pasta = os.path.join(visao.BASE_DIR, "logs", "coleta_falhas")
-    os.makedirs(pasta, exist_ok=True)
-    cv2.imwrite(os.path.join(pasta, time.strftime("%H%M%S") + "_osso_menu.png"), rec)
-
-
-_fotos_menu_osso = 0
-
-
 def pegar_osso(img, ossos):
     for osso in sorted(ossos, key=lambda o: distancia(CENTRO, o["pos"]))[:2]:
         pos = osso["pos"]
@@ -618,7 +840,8 @@ def pegar_osso(img, ossos):
             if r is None:
                 return False  # clique cancelado: não passa para o próximo osso
             if not r:
-                foto_menu_osso()
+                # diagnóstico: o menu de osso que falhou (visto em 15/11: 8 de 544 recusados, ~0,901)
+                foto_diagnostico("coleta_falhas", _ultimo_menu["rec"], "_osso_menu")
                 salvar_amostra("osso_rej", img, pos, score=osso["score"])
                 continue
         salvar_amostra("osso_ok", img, pos, score=osso["score"])
@@ -689,17 +912,6 @@ class ColetaChao:
         if depois is not None:
             cv2.imwrite(os.path.join(pasta, nome + "_depois.png"), depois)
 
-    def _foto_inventario(self, antes, depois):
-        """Inventário antes|depois lado a lado (coleta confirmada rápido demais)."""
-        global _fotos_falha
-        if _fotos_falha >= COLETA_MAX_FOTOS:
-            return
-        _fotos_falha += 1
-        pasta = os.path.join(visao.BASE_DIR, "logs", "coleta_falhas")
-        os.makedirs(pasta, exist_ok=True)
-        cv2.imwrite(os.path.join(pasta, time.strftime("%H%M%S") + f"_{self.item}_inventario_rapido.png"),
-                    np.hstack([antes, depois]))
-
     def _falhou(self, img, alvo, motivo, depois=None, ignorar="alvo"):
         """`ignorar`: ponto da tela onde a pilha que falhou está agora ("alvo" = onde estava
         no início; None = não se sabe, não ignora nada)."""
@@ -750,12 +962,11 @@ class ColetaChao:
         # longas (a tela desliza e outra pilha do item entra no caminho). Duas leituras
         # seguidas, para um redesenho isolado não contar.
         seguidas = [0]
-        leitura = {"inv": inv_antes, "px": 0}
+        leitura = {"px": 0}
         clique = time.perf_counter()
 
         def mudou():
-            leitura["inv"] = capturar(visao.INVENTARIO_ITENS)
-            dif = cv2.absdiff(leitura["inv"], inv_antes).max(axis=2) > INVENTARIO_DIF_TOM
+            dif = cv2.absdiff(capturar(visao.INVENTARIO_ITENS), inv_antes).max(axis=2) > INVENTARIO_DIF_TOM
             leitura["px"] = int(dif.sum())
             if time.perf_counter() - clique < INVENTARIO_ESPERA_MIN:
                 return False  # mudança antes disso não pode ser a coleta (passageira)
@@ -772,8 +983,6 @@ class ColetaChao:
             self.recem_pos = pos
             _ultima_coleta.update(t=time.time(), dist=dist)
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
-            if dt < INVENTARIO_RAPIDA:  # diagnóstico: o que mudou no inventário tão rápido?
-                self._foto_inventario(inv_antes, leitura["inv"])
         else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
             depois = capturar()
@@ -815,10 +1024,13 @@ def atacar_sapo(img, sapos, t_quadro=None):
                pos=[int(pos[0]), int(pos[1])], idade=idade)
         if chave != PERFIL["texto"]:
             salvar_amostra(f"{NOME_PERFIL}_rej", img, pos, area=sapo["area"], texto=chave)
+            limiar = visao.limiar_texto(PERFIL["texto"])
+            if limiar - TEXTO_QUASE <= scores[PERFIL["texto"]] < limiar:  # quase: por que não passou?
+                foto_diagnostico("texto_quase", faixa)
             continue
         salvar_amostra(f"{NOME_PERFIL}_ok", img, pos, area=sapo["area"])
         novo, desloc = refinar_mira(pos)
-        if desloc is not None and desloc >= MIRA_DESLOC_MIN:
+        if desloc is not None and MIRA_DESLOC_MIN <= desloc <= MIRA_DESLOC_MAX:
             mover(novo)
             pos = novo
         desloc = None if desloc is None else round(desloc, 1)
@@ -827,11 +1039,11 @@ def atacar_sapo(img, sapos, t_quadro=None):
             LOG.ev("atacar", ok=False, lat=0.0, dist=round(dist), barra=barra, clique=clique,
                    desloc=desloc)
             return False
-        ok, dt = esperar(lambda: visao.estado_combate(capturar()) == "lutando",
+        ok, dt = esperar(lambda: visao.estado_combate(capturar(PAINEL)) == "lutando",
                          ESPERA_INICIO_COMBATE, 0.1)
         LOG.ev("atacar", ok=ok, lat=round(dt, 3), dist=round(dist), barra=barra, clique=clique,
                desloc=desloc)
-        if not ok:
+        if not ok and SALVAR_AMOSTRAS:  # sem a flag, a captura do 'depois' seria à toa
             salvar_amostra("ataque_falhou_antes", img, pos, barra=barra)
             salvar_amostra("ataque_falhou_depois", capturar(), pos, barra=barra)
         return ok
@@ -844,25 +1056,6 @@ def area_loot():
             CENTRO[0] + RAIO_LOOT + 10, CENTRO[1] + RAIO_LOOT + 10)
 
 
-def esperar_loot_rotulo(inicio):
-    """Monstro sem "Big bones" (perfil aprendido com osso nulo): espera aparecer texto
-    branco novo de rótulo de item em volta do personagem, ou o tempo do perfil acabar."""
-    area = area_loot()
-    base = visao.mascara_rotulos(capturar(area))[0]
-    seguidas = [0]
-
-    def caiu():
-        # duas leituras seguidas, e nunca antes de LOOT_ROTULO_MIN da morte (o loot leva ~2-3 s)
-        novo = visao.rotulo_novo(base, visao.mascara_rotulos(capturar(area))[0])
-        seguidas[0] = seguidas[0] + 1 if novo else 0
-        return seguidas[0] >= 2 and time.perf_counter() - inicio >= LOOT_ROTULO_MIN
-
-    restante = max(ESPERA_LOOT - (time.perf_counter() - inicio), 0.1)
-    ok, _ = esperar(caiu, restante, 0.05)
-    LOG.ev("loot", ok=ok, lat=round(time.perf_counter() - inicio, 3), via="rotulo")
-    return ok
-
-
 def recorte_loot(raio):
     """(x1, y1, x2, y2) da janela onde cabe todo rótulo de loot a até `raio` px do
     personagem: os rótulos ficam acima da pilha (até 8 linhas de 22 px) e se estendem
@@ -873,28 +1066,97 @@ def recorte_loot(raio):
             min(CENTRO[1] + raio + LOOT_MARGEM_ABAIXO, tela.ALTURA))
 
 
-def esperar_loot(inicio):
-    """O osso só aparece ~2 s depois da barra de vida zerar: espera por ele."""
+def esperar_loot(inicio, osso=True):
+    """O osso só aparece ~2 s depois da barra de vida zerar: espera por ele. Monstro que não
+    larga Big bones (aprendido sem saber): o loot cai com rótulo de outro item; sem osso
+    LOOT_SEM_OSSO_SEG depois dele, para de esperar (o resto do ESPERA_LOOT seria à toa).
+    `osso=False` (perfil sem osso): aceita qualquer rótulo novo depois de LOOT_ROTULO_MIN."""
     # Só olha em volta do personagem: ~10x mais rápido que varrer a janela toda
     area = area_loot()
+    base = visao.mascara_rotulos(capturar(area))[0]
+    st = {"seguidas": 0, "outro_desde": None, "via": None if osso else "rotulo"}
 
-    def osso_perto():
-        ossos = visao.detectar_ossos_chao(capturar(area), origem=area[:2])
-        return any(distancia(CENTRO, o["pos"]) < RAIO_LOOT for o in ossos)
+    def pronto():
+        rec = capturar(area)
+        m = visao.mascara_rotulos(rec)
+        if osso and any(distancia(CENTRO, o["pos"]) < RAIO_LOOT
+                        for o in visao.detectar_ossos_chao(rec, origem=area[:2], mascara=m)):
+            st["via"] = "osso"
+            return True
+        agora = time.perf_counter()
+        st["seguidas"] = st["seguidas"] + 1 if visao.rotulo_novo(base, m[0]) else 0
+        if st["seguidas"] == 0:
+            st["outro_desde"] = None  # o rótulo novo sumiu (dica do mouse, item passageiro)
+        # duas leituras seguidas, e nunca antes de LOOT_ROTULO_MIN da morte (o loot leva ~2-3 s)
+        if st["seguidas"] >= 2 and agora - inicio >= LOOT_ROTULO_MIN:
+            if not osso:
+                return True
+            if st["outro_desde"] is None:
+                st["outro_desde"] = agora
+            elif agora - st["outro_desde"] >= LOOT_SEM_OSSO_SEG and agora - inicio >= LOOT_SEM_OSSO_MIN:
+                st["via"] = "rotulo_sem_osso"
+                return True
+        return False
 
     restante = max(ESPERA_LOOT - (time.perf_counter() - inicio), 0.1)
-    ok, _ = esperar(osso_perto, restante, 0.05)
-    LOG.ev("loot", ok=ok, lat=round(time.perf_counter() - inicio, 3))
+    ok, _ = esperar(pronto, restante, 0.05)
+    LOG.ev("loot", ok=ok, lat=round(time.perf_counter() - inicio, 3), via=st["via"])
     return ok
 
 
 # ========== Loops ==========
+def coletar_chao(img, raio, coletar):
+    """Uma coleta do chão em volta do personagem: runas e moedas primeiro (valem mais e caem
+    na mesma pilha), depois ossos (se `coletar`). Devolve (agiu, t): agiu = "osso", True (outro
+    item) ou False; t = perf_counter do fim da detecção (o tempo 'rotulos' do log)."""
+    coletas = [c for c in COLETAS if c.ativas()]
+    if not (coletar or coletas):
+        return False, time.perf_counter()
+    # só o recorte que pode ter loot dentro do raio (metade do tempo com raio 280)
+    x1, y1, x2, y2 = recorte_loot(raio)
+    sub = img[y1:y2, x1:x2]
+    mascara = visao.mascara_rotulos(sub)
+    ossos = [o for o in visao.detectar_ossos_chao(sub, origem=(x1, y1), mascara=mascara)
+             if distancia(CENTRO, o["pos"]) <= raio]
+    for coleta in coletas:
+        itens = coleta.detectar(sub, ossos=ossos, mascara=mascara, raio=raio, origem=(x1, y1))
+        if itens and coleta.pegar(img, itens):
+            return True, time.perf_counter()
+    t = time.perf_counter()
+    if coletar and ossos and pegar_osso(img, ossos):
+        return "osso", t
+    return False, t
+
+
+def aproveitar_pausa(img):
+    """Pausa por vida baixa: não ataca, mas pega o loot perto (COLETA_RAIO_PERTO) e enterra os
+    ossos da mochila, que não começam luta e contam como atividade (sem desconexão por
+    inatividade). Em luta (alguém atacou), só enterra. Devolve "osso", True ou False (nada a
+    fazer: o laço mantém a conexão)."""
+    if garantir_mochila(img):
+        return True
+    coletar = ossos_ativos.is_set() and PERFIL.get("osso", True)
+    inventario = (visao.detectar_ossos_inventario(visao.recortar(img, visao.INVENTARIO))
+                  if coletar else [])
+    ENTERRO.conferir(len(inventario))
+    if visao.estado_combate(img) != "lutando":
+        agiu, _ = coletar_chao(img, COLETA_RAIO_PERTO, coletar)
+        if agiu:
+            LOG.ev("pausa_coleta", item="osso" if agiu == "osso" else "item")
+            return agiu
+    if inventario and ENTERRO.pode():
+        ENTERRO.um(inventario, "pausa")
+        return True
+    return False
+
+
 def loop_principal():
     sapos_atacados = 0
     ossos_pegos = 0
     inicio_sessao = time.time()
     em_luta = False
     inicio_luta = 0.0
+    livre_desde = None  # em luta, o painel do oponente sumiu desde então (COMBATE_LIVRE_SEG)
     em_foco = True
     avisou_inativo = False
     vigia_vida = VIGIA_VIDA  # do módulo: um recomeço do laço (erro) não esquece a pausa
@@ -912,8 +1174,12 @@ def loop_principal():
             elif not avisou_inativo and time.time() - ultima_entrada > AVISO_INATIVO_SEG:
                 avisou_inativo = True
                 LOG.ev("inativo_fora_de_foco", seg=round(time.time() - ultima_entrada))
-                print("\n⚠️ Jogo fora de foco e sem entrada há 4 min: ele desconecta em ~1 min. "
-                      "Volte o foco para o jogo (se desconectar, o bot volta sozinho).")
+                if tela.area_cliente() is None:  # sem janela do jogo: jogo_em_foco acha a nova
+                    print("\n⚠️ A janela do jogo sumiu (fechada?). Abra e entre no jogo: o bot "
+                          "continua sozinho.")
+                else:
+                    print("\n⚠️ Jogo fora de foco e sem entrada há 4 min: ele desconecta em ~1 min. "
+                          "Volte o foco para o jogo (se desconectar, o bot volta sozinho).")
             sem_leitura_desde = None  # tempo fora do jogo não conta como falha de leitura
             time.sleep(0.5)
             continue
@@ -995,7 +1261,9 @@ def loop_principal():
                                     time.strftime("vida_baixa_%Y%m%d_%H%M%S.png"))
                 cv2.imwrite(foto, img)  # para conferir depois o que foi lido
                 LOG.ev("vida_baixa", pct=round(vida, 3), foto=os.path.basename(foto))
-                print(f"\n🚨 VIDA BAIXA (~{100 * vida:.0f}%): bot pausado. Coma ou saia da área!")
+                print(f"\n🚨 VIDA BAIXA (~{100 * vida:.0f}%): bot pausado. Coma ou saia da área; ele "
+                      f"volta sozinho acima de {VIDA_RETOMAR:.0%}.")
+                tela.bip("erro")  # o terminal fica atrás do jogo
             elif mudanca == "retomar":
                 LOG.ev("vida_ok", pct=round(vida, 3))
                 print(f"💚 Vida recuperada (~{100 * vida:.0f}%): bot retomado.")
@@ -1014,19 +1282,30 @@ def loop_principal():
                 if vigia_vida.pausado:
                     consequencia = "O bot segue pausado."
                 elif not alinhado:
-                    consequencia = ("O bot fica parado até ela aparecer "
-                                    "(para ignorar: --sem-vida).")
+                    consequencia = ("Não acho a interface do jogo no lugar de sempre: o bot fica parado "
+                                    "até ela voltar. Confira: jogo logado, janela maximizada, layout "
+                                    "'Resizable - Classic' e nada por cima dos orbes ao lado do minimapa.")
                 else:
                     consequencia = "A pausa por vida baixa NÃO está funcionando."
-                print(f"\n⚠️ Não consigo ler o orbe de vida há {agora - sem_leitura_desde:.0f} s "
-                      f"(ele está visível, sem nada por cima?). {consequencia}")
+                if "fora" not in RECONEXAO.avisou:  # desconectado: o aviso da reconexão já basta
+                    print(f"\n⚠️ Não consigo ler o orbe de vida há {agora - sem_leitura_desde:.0f} s "
+                          f"(ele está visível, sem nada por cima?). {consequencia}")
         if vigia_vida.pausado:
-            if alinhado:  # tela de jogo (não a de login): mantém a conexão enquanto espera
-                manter_conectado()
-            time.sleep(0.5)
+            # tela de jogo (não a de login): enquanto a vida sobe, pega o loot perto e enterra
+            # ossos (não ataca); sem nada para fazer, só mantém a conexão
+            agiu = aproveitar_pausa(img) if alinhado else False
+            if agiu == "osso":
+                ossos_pegos += 1
+                print(f"🦴 Ossos coletados do chão (na pausa): {ossos_pegos}")
+            if not agiu:
+                if alinhado:
+                    manter_conectado()
+                time.sleep(0.5)
             continue
         if not alinhado:
             time.sleep(0.2)
+            continue
+        if garantir_mochila(img):
             continue
         estado = visao.estado_combate(img)
         coletar = ossos_ativos.is_set() and PERFIL.get("osso", True)
@@ -1037,8 +1316,24 @@ def loop_principal():
         )
         ENTERRO.conferir(len(inventario))
 
+        # Painel do oponente sumido no meio da luta: espera um pouco antes de dar a luta por
+        # encerrada (ele pode voltar; visto com Skeleton)
+        if em_luta and estado == "livre":
+            agora = time.time()
+            if livre_desde is None:
+                livre_desde = agora
+                foto_diagnostico("combate_livre", img)
+            if agora - livre_desde < COMBATE_LIVRE_SEG:
+                time.sleep(0.1)
+                continue
+        elif livre_desde is not None:
+            if em_luta and estado == "lutando":
+                LOG.ev("painel_voltou", seg=round(time.time() - livre_desde, 2))
+            livre_desde = None
+
         # Fim de luta: enterra um osso enquanto espera o loot cair
         if em_luta and estado != "lutando":
+            livre_desde = None
             em_luta = False
             LOG.ev("fim_combate", dur=round(time.time() - inicio_luta, 2), estado=estado)
             if estado == "morto":
@@ -1053,7 +1348,7 @@ def loop_principal():
                     ENTERRO.um(inventario, "loot")
                 esperar_loot(t0)
             elif estado == "morto" and not PERFIL.get("osso", True) and any(c.ativas() for c in COLETAS):
-                esperar_loot_rotulo(t0)
+                esperar_loot(t0, False)  # perfil sem osso: qualquer rótulo novo
             continue
 
         # Em combate: não clica em outro alvo; aproveita para enterrar
@@ -1078,35 +1373,23 @@ def loop_principal():
         # Monstros na tela: com algum à vista, o loot longe fica para depois
         t2 = time.perf_counter()
         sapos = visao.detectar_sapos(img, PERFIL)
+        if not sapos and PERFIL.get("nome_npc") is not None:
+            avisar_sem_nomes(img)
         t3 = t4 = time.perf_counter()
         raio = COLETA_RAIO_PERTO if sapos else COLETA_RAIO_MAX
 
         # Loot do chão: runas e moedas primeiro (valem mais e caem na mesma pilha), depois ossos
-        coletas = [c for c in COLETAS if c.ativas()]
-        if coletar or coletas:
-            # só o recorte que pode ter loot dentro do raio (metade do tempo com raio 280)
-            x1, y1, x2, y2 = recorte_loot(raio)
-            sub = img[y1:y2, x1:x2]
-            mascara = visao.mascara_rotulos(sub)
-            ossos = [o for o in visao.detectar_ossos_chao(sub, origem=(x1, y1), mascara=mascara)
-                     if distancia(CENTRO, o["pos"]) <= raio]
-            agiu = False
-            for coleta in coletas:
-                itens = coleta.detectar(sub, ossos=ossos, mascara=mascara, raio=raio, origem=(x1, y1))
-                if itens and coleta.pegar(img, itens):
-                    agiu = True
-                    break
-            t4 = time.perf_counter()
-            if agiu:
-                continue
-            if coletar and ossos and pegar_osso(img, ossos):
-                ossos_pegos += 1
-                print(f"🦴 Ossos coletados do chão: {ossos_pegos}")
-                continue
+        agiu, t4 = coletar_chao(img, raio, coletar)
+        if agiu == "osso":
+            ossos_pegos += 1
+            print(f"🦴 Ossos coletados do chão: {ossos_pegos}")
+        if agiu:
+            continue
 
-        # A espera da mira deixou o quadro velho (~1 s, tela andando): ataca por um quadro novo,
-        # conferido como o do começo do ciclo (visto: 2 hovers falhos com quadro de 1,0-1,3 s)
-        if _mira["perdida"]:
+        # A espera da mira (~1 s, tela andando) ou uma coleta que falhou pelo menu (~3,9 s) deixou
+        # o quadro velho: ataca por um quadro novo, conferido como o do começo do ciclo (visto: 2
+        # hovers falhos com quadro de 1,0-1,3 s). A mira perdida conta mesmo com o quadro novo.
+        if _mira["perdida"] or time.perf_counter() - t0 > QUADRO_VELHO_SEG:
             _mira["perdida"] = False
             t0 = time.perf_counter()
             img = capturar()
@@ -1162,18 +1445,16 @@ def executar_principal():
             break
         except Exception as erro:
             traceback.print_exc()
-            sct = _local.__dict__.pop("sct", None)  # recria a captura do zero
-            if sct is not None:
-                try:
-                    sct.close()
-                except Exception:
-                    pass
+            tela.reiniciar_captura()  # a próxima captura abre do zero
             agora = time.time()
             erros = [t for t in erros if agora - t < 600] + [agora]
             LOG.ev("erro", tipo=type(erro).__name__, msg=str(erro)[:200],
                    onde=traceback.format_exc()[-1500:], seguidos=len(erros))
             if len(erros) >= 3:
-                print("\n🛑 3 erros em 10 min: bot encerrado (evento 'erro' no log).")
+                print(f"\n🛑 O bot parou depois de 3 erros em 10 min. Ligue de novo; se repetir, "
+                      f"guarde o arquivo {LOG.caminho}.")
+                tela.bip("erro")
+                time.sleep(1)  # o bipe é assíncrono: o os._exit logo abaixo cortaria o som
                 break
             print("\n⚠️ Erro inesperado (evento 'erro' no log): recomeço em 5 s.")
             time.sleep(5)

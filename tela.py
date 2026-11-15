@@ -1,4 +1,5 @@
-"""Entrada e saída compartilhadas pelos bots: janela do jogo, captura, mouse e log.
+"""Entrada e saída compartilhadas pelos bots: janela do jogo, captura, mouse, F9 do ensino,
+bipe e log.
 
 Todas as posições são em coordenadas da captura calibrada (janela maximizada; ver
 visao.CLIENTE_CALIBRADO). A captura acompanha a área do jogo onde quer que a janela
@@ -22,8 +23,8 @@ import visao
 TITULO_JANELA = "Old School RuneScape"
 TEMPO_MOUSE_PARADO = 1.0  # pausa quando VOCÊ mexe o mouse
 HOVER_ATRASO_MIN = 0.06  # ignora leituras antes disso (texto antigo ainda na tela)
-HOVER_TIMEOUT = 0.25
-CLIQUE_TIMEOUT = 0.25
+HOVER_TIMEOUT = 0.25  # medido: o texto certo aparece em ~0,09 s
+CLIQUE_TIMEOUT = 0.25  # X de clique: aparece ~40 ms depois do clique e dura ~300 ms
 PONTO_NEUTRO = (1593, 960)  # coluna de pedra do inventário: sem tooltip
 
 pyautogui.PAUSE = 0.03  # o import do pyautogui também deixa o processo "DPI aware"
@@ -67,6 +68,10 @@ def atualizar_janela():
         return "não consegui ler a posição da janela do jogo"
     left, top, problema = visao.alinhar_captura(cliente)
     REGIAO["left"], REGIAO["top"] = left, top
+    if problema and cliente[2] > 0 and _user32.IsZoomed(JANELA._hWnd):  # maximizar não resolve
+        problema = (f"o jogo já está maximizado, mas a área dele tem {cliente[2]}x{cliente[3]} px: o bot "
+                    "foi calibrado para monitor 1920x1200 com a escala do Windows em 125% "
+                    "(Configurações > Sistema > Vídeo) e a barra de tarefas visível")
     return problema
 
 
@@ -108,7 +113,19 @@ def capturar(regiao=None):
         x1, y1, x2, y2 = regiao
         area = {"left": REGIAO["left"] + x1, "top": REGIAO["top"] + y1,
                 "width": x2 - x1, "height": y2 - y1}
-    return cv2.cvtColor(np.array(_local.sct.grab(area)), cv2.COLOR_BGRA2BGR)
+    # asarray: sem cópia (o mss faz um buffer novo a cada grab; o cvtColor já devolve outro)
+    return cv2.cvtColor(np.asarray(_local.sct.grab(area)), cv2.COLOR_BGRA2BGR)
+
+
+def reiniciar_captura():
+    """Descarta a captura desta thread; a próxima capturar() abre outra do zero (depois de um
+    erro da captura de tela, ex.: o Windows trocou de sessão)."""
+    sct = _local.__dict__.pop("sct", None)
+    if sct is not None:
+        try:
+            sct.close()
+        except Exception:
+            pass
 
 
 def caixa(pos, raio_x, raio_y=None):
@@ -206,6 +223,58 @@ def tecla(nome):
     pyautogui.press(nome)
 
 
+# ---------- Teclado (F9 do ensino) e aviso sonoro ----------
+def ler_quadro_e_mouse():
+    """O quadro inteiro e o mouse no mesmo instante: (img, pos na captura, problema).
+    `problema`: o texto de atualizar_janela() (janela fora do lugar), ou None."""
+    problema = atualizar_janela()
+    mx, my = pyautogui.position()
+    img = capturar()
+    return img, (mx - REGIAO["left"], my - REGIAO["top"]), problema
+
+
+def esperar_soltar(tecla):
+    import keyboard  # só quem lê o teclado precisa dele (o yew.py não)
+
+    while keyboard.is_pressed(tecla):
+        time.sleep(0.02)
+
+
+def ler_f9(timeout=None):
+    """Espera o F9 (até `timeout` s; 0 = só confere se está apertado agora) e lê a tela e o
+    mouse na hora do aperto (ler_quadro_e_mouse). Devolve (img, pos, problema) depois de a
+    tecla ser solta, ou None se o tempo acabou."""
+    import keyboard
+
+    inicio = time.time()
+    while not keyboard.is_pressed("f9"):
+        if timeout is not None and time.time() - inicio >= timeout:
+            return None
+        time.sleep(0.02)
+    leitura = ler_quadro_e_mouse()
+    esperar_soltar("f9")
+    return leitura
+
+
+def com_dica_de_foco(motivo):
+    """`motivo` de um F9 recusado, mais a causa provável se o jogo não estiver na frente (a
+    captura pega a janela que estiver por cima dele)."""
+    if jogo_em_foco():
+        return motivo
+    return f"{motivo} (o jogo não está na frente: clique nele e aperte F9 de novo)"
+
+
+def bip(tipo="ok"):
+    """Aviso sonoro ('ok', 'erro', 'pergunta'): no ensino o terminal fica atrás do jogo e as
+    mensagens não aparecem."""
+    try:
+        import winsound
+        winsound.MessageBeep({"ok": winsound.MB_OK, "erro": winsound.MB_ICONHAND,
+                              "pergunta": winsound.MB_ICONASTERISK}[tipo])
+    except Exception:
+        pass
+
+
 def distancia(p1, p2):
     return float(np.hypot(p1[0] - p2[0], p1[1] - p2[1]))
 
@@ -222,24 +291,20 @@ def esperar(condicao, timeout, intervalo=0.05):
         time.sleep(intervalo)
 
 
-def texto_acao(chave):
-    """Score (0-1) do texto de ação atual contra o template `chave`."""
-    return visao.score_texto(capturar(visao.FAIXA_TEXTO_ACAO), chave)
-
-
 def esperar_texto(chaves, timeout=HOVER_TIMEOUT):
     """Depois de mover o mouse, espera o texto de ação virar um dos `chaves`.
 
-    Devolve (chave ou None, latência, {chave: maior score}). Exige duas leituras
-    seguidas iguais para não clicar com texto de passagem.
+    Devolve (chave ou None, latência em s, {chave: maior score visto}, última faixa lida).
+    Exige duas leituras seguidas iguais para não clicar com texto de passagem.
     """
     inicio = time.perf_counter()
     melhores = {c: 0.0 for c in chaves}
     anterior = None
+    faixa = None
     while True:
         dt = time.perf_counter() - inicio
         if dt > timeout:
-            return None, dt, melhores
+            return None, dt, melhores, faixa
         if dt < HOVER_ATRASO_MIN:
             time.sleep(0.01)
             continue
@@ -251,7 +316,7 @@ def esperar_texto(chaves, timeout=HOVER_TIMEOUT):
             if achou is None and s >= visao.limiar_texto(c):
                 achou = c
         if achou is not None and achou == anterior:
-            return achou, dt, melhores
+            return achou, dt, melhores, faixa
         anterior = achou
         time.sleep(0.01)
 

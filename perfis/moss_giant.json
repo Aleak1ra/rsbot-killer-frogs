@@ -1,0 +1,56 @@
+{
+  "nome": "Moss giant",
+  "cor": [
+    [
+      25,
+      87,
+      60
+    ],
+    [
+      32,
+      126,
+      128
+    ]
+  ],
+  "area": [
+    158,
+    2532
+  ],
+  "fechar": 5,
+  "espera_loot": 4.5,
+  "loot_menu": true,
+  "osso": "Big bones",
+  "desloc_matiz": 0,
+  "texto": {
+    "limiar": 0.93,
+    "altura": 24,
+    "largura": 238,
+    "molde": "moss_giant_texto.png"
+  },
+  "aprendido": {
+    "exemplos": 1,
+    "area_ref": 633.0,
+    "caixa_ref": [
+      38,
+      72
+    ],
+    "vazamento": 0.0
+  },
+  "barra": [
+    53,
+    63,
+    -18
+  ],
+  "raio_mira": 137,
+  "area_mira": 158,
+  "nome_npc": {
+    "desloc": [
+      6,
+      48
+    ],
+    "limiar": 0.7,
+    "achados": 1,
+    "molde": "moss_giant_npc.png"
+  },
+  "exemplos": "moss_giant_exemplos"
+}

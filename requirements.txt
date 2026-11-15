@@ -1,0 +1,12 @@
+# Pacotes do bot. Instalar: python -m pip install -r requirements.txt (o "Iniciar bot.bat" já faz isso).
+# Testado em 15/11/2026 com Python 3.12.1: opencv-python 4.11.0.86, numpy 2.2.5, mss 10.0.0,
+# PyAutoGUI 0.9.54, PyGetWindow 0.0.9, keyboard 0.13.5.
+# OpenCV fixo: os limiares (matchTemplate, blur) foram calibrados com ele, e o pacote pronto
+# (wheel) dele serve para qualquer Python 3. O resto em faixas: num Python mais novo o
+# numpy 2.2.5 pode não ter wheel, e o pip tentaria compilar (e falharia).
+opencv-python==4.11.0.86
+numpy>=2.2,<3
+mss>=10,<11
+PyAutoGUI>=0.9.54,<0.10
+PyGetWindow>=0.0.9
+keyboard>=0.13.5,<0.14

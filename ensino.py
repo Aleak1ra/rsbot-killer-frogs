@@ -1,6 +1,7 @@
 """Aprende o perfil de um monstro novo a partir de exemplos: (quadro, ponto do mouse sobre ele).
 
-Só funções sobre imagens: não lê a tela nem mexe no mouse (quem faz isso é ensinar.py).
+Não lê a tela nem mexe no mouse (quem faz isso é main.py, no F9 do bot, ou ensinar.py): as
+funções trabalham sobre imagens, e a classe Ensino junta os exemplos e grava o perfil.
 O perfil gerado é o mesmo molde dos feitos à mão em visao.PERFIS (cor, área, barra, mira...),
 gravado em perfis/<nome>.json e carregado por visao.carregar_perfil.
 
@@ -28,7 +29,7 @@ BURACO_TEXTO = 14  # px sem tinta que separam o texto de ação do " / N more op
 # 353 faixas: "Attack ..." >= 0,999; "Take ...", "Walk here" etc. <= 0,64.
 ATAQUE = visao._carregar("text_mask_attack_osrs.png", cinza=True)
 ATAQUE_LIMIAR = 0.9
-LIMIAR_TEXTO_APRENDIDO = 0.95
+LIMIAR_TEXTO_APRENDIDO = visao.LIMIAR_TEXTO_SEM_NIVEL  # o molde perde os dígitos do nível ao carregar
 
 
 def _linha_texto(tinta):
@@ -46,11 +47,13 @@ def gerar_molde_texto(faixa):
     """Molde do texto de ação "Attack <Nome> (level-N)" a partir de UMA faixa.
 
     `faixa`: recorte FAIXA_TEXTO_ACAO com o mouse sobre o monstro. Devolve (molde, motivo):
-    molde em visao.mascara_texto_geral, ou None se a faixa não serve (`motivo` diz por quê).
-    O molde inclui o nível: parar no nome aceitaria outro monstro cujo nome começa igual
-    ("Cow" pegaria "Cow calf"), visto na revisão.
+    molde em visao.mascara_texto(faixa, nivel_qualquer_cor=True), ou None se a faixa não serve
+    (`motivo` diz por quê).
+    O molde vai até o fim do "(level-N)": parar no nome aceitaria outro monstro cujo nome começa
+    igual ("Cow" pegaria "Cow calf"), visto na revisão. Os dígitos do nível são tirados ao usar
+    (visao.cortar_nivel): o mesmo monstro de outro nível também serve.
     """
-    m = visao.mascara_texto_geral(faixa)
+    m = visao.mascara_texto(faixa, True)
     tinta = m > 100
     tinta[:TOPO_FAIXA] = False
     linha = _linha_texto(tinta)
@@ -73,17 +76,17 @@ def gerar_molde_texto(faixa):
     verbo = m[:, :int(cc[0])]
     if verbo.shape[1] < ATAQUE.shape[1] or \
             float(cv2.matchTemplate(verbo, ATAQUE, cv2.TM_CCOEFF_NORMED).max()) < ATAQUE_LIMIAR:
-        return None, "o texto não começa com 'Attack' (o mouse está sobre o monstro?)"
+        return None, ("o texto do canto não começa com 'Attack': ponha o mouse em cima do monstro; se "
+                      "aparecer 'Walk here', mude a opção NPC 'Attack' options para 'Left-click "
+                      "where available' nas configurações do jogo")
     x_fim = int(cc[-1])
     molde = m[max(y1 - 2, 0):min(y2 + 3, m.shape[0]), max(int(cols[0]) - 2, 0):x_fim + 3].copy()
     return molde, None
 
 
 def score_molde(faixa, molde):
-    mm = visao.mascara_texto_geral(faixa)
-    if mm.shape[0] < molde.shape[0] or mm.shape[1] < molde.shape[1]:
-        return 0.0
-    return float(cv2.matchTemplate(mm, molde, cv2.TM_CCOEFF_NORMED).max())
+    """Nota da faixa no molde como o bot vai usar (sem os dígitos do nível: visao.cortar_nivel)."""
+    return visao.nota_molde(faixa, visao.cortar_nivel(molde), True)
 
 
 # ---------- Cor do corpo ("varinha mágica") ----------
@@ -334,15 +337,51 @@ def deduzir_parametros(caixa_ref, area_ref):
     }
 
 
+# ---------- Nome do NPC em ciano ("NPC Highlights" do cliente oficial) ----------
+NOME_NPC_TOLERANCIA = (12, 8)  # px: o nome achado pelo molde tem que cair na linha achada
+
+
+def aprender_nome_npc(exemplos):
+    """Nome do NPC em ciano acima do monstro: {'molde', 'desloc': (dx, dy), 'achados': n} ou None.
+
+    O molde vem do 1º exemplo com nome; o deslocamento (do centro do nome achado pelo molde, como
+    o bot vai achar, até o ponto do mouse) é a mediana dos exemplos onde o molde achou o nome."""
+    molde, descs = None, []
+    for img, pos in exemplos:
+        caixa = visao.achar_nome_acima(img, pos)
+        if caixa is None:
+            continue
+        if molde is None:
+            molde = visao.molde_nome_npc(img, caixa)
+        cx, cy = caixa[0] + caixa[2] / 2, caixa[1] + caixa[3] / 2
+        so_nome = {"nome_npc": (molde, (0, 0), visao.NOME_NPC_LIMIAR)}
+        perto = [s["nome"] for s in visao.detectar_por_nome(img, so_nome, interface=False)
+                 if abs(s["nome"][0] - cx) <= NOME_NPC_TOLERANCIA[0] and abs(s["nome"][1] - cy) <= NOME_NPC_TOLERANCIA[1]]
+        if not perto:
+            continue  # outro nome (outro NPC) ou nome encavalado: não entra no deslocamento
+        n = min(perto, key=lambda q: abs(q[0] - cx) + abs(q[1] - cy))
+        descs.append((pos[0] - n[0], pos[1] - n[1]))
+    if molde is None or not descs:
+        return None
+    dx, dy = np.median(np.array(descs, dtype=float), axis=0)
+    return {"molde": molde, "desloc": (int(round(dx)), int(round(dy))), "achados": len(descs)}
+
+
 # ---------- Perfil em arquivo ----------
 def montar_perfil(nome_jogo, molde, exemplos, espera_loot=4.5, loot_menu=True, osso="Big bones"):
     """Dict do perfil (formato de perfis/<nome>.json, sem o molde) ou None.
 
     `osso`: "Big bones" (o único osso que o bot conhece: pega, enterra e espera por ele) ou
-    None (monstro que larga outro osso ou nenhum: o bot só pega runas e moedas)."""
+    None (monstro que larga outro osso ou nenhum: o bot só pega runas e moedas).
+    Com o nome do NPC em ciano na tela (aprender_nome_npc), o perfil acha o monstro pelo nome
+    ('nome_npc'; o molde vai em '_molde_npc' até salvar_perfil) e a cor fica de reserva."""
     cor = aprender_cor(exemplos)
-    if cor is None:
+    nome = aprender_nome_npc(exemplos)
+    if cor is None and nome is None:
         return None
+    if cor is None:  # só o nome serve (a cor do corpo se confunde com o cenário)
+        cor = {"cor": ((0, 0, 0), (0, 0, 0)), "area": (0, 0), "area_ref": 0.0, "caixa_ref": (40, 40),
+               "vazamento": 0.0, "desloc_matiz": 0}
     perfil = {
         "nome": nome_jogo,
         "cor": [list(map(int, cor["cor"][0])), list(map(int, cor["cor"][1]))],
@@ -358,6 +397,16 @@ def montar_perfil(nome_jogo, molde, exemplos, espera_loot=4.5, loot_menu=True, o
     }
     p = deduzir_parametros(cor["caixa_ref"], cor["area_ref"])
     perfil.update({k: list(v) if isinstance(v, tuple) else v for k, v in p.items()})
+    if nome is not None:
+        dx, dy = nome["desloc"]
+        th, tw = nome["molde"].shape[:2]
+        perfil["nome_npc"] = {"desloc": [dx, dy], "limiar": visao.NOME_NPC_LIMIAR, "achados": nome["achados"]}
+        perfil["_molde_npc"] = nome["molde"]
+        # a barra de vida de quem já luta fica logo abaixo do nome: de 15 px acima do centro
+        # do nome até 30 px abaixo dele (o corpo, onde fica `pos`, está dy abaixo do nome)
+        perfil["barra"] = [int(max(45, tw // 2 + 10)), int(dy + 15), int(30 - dy)]
+        # a correção da mira procura o nome num recorte em volta do corpo: tem que caber
+        perfil["raio_mira"] = int(max(perfil["raio_mira"], abs(dy) + th + 20, abs(dx) + tw))
     return perfil
 
 
@@ -367,6 +416,10 @@ def salvar_perfil(nome, perfil, molde, exemplos=(), faixas=(), pasta=None):
     pasta = pasta or visao.PASTA_PERFIS
     os.makedirs(pasta, exist_ok=True)
     perfil = dict(perfil, texto=dict(perfil["texto"], molde=f"{nome}_texto.png"))
+    molde_npc = perfil.pop("_molde_npc", None)
+    if perfil.get("nome_npc") and molde_npc is not None:
+        perfil["nome_npc"] = dict(perfil["nome_npc"], molde=f"{nome}_npc.png")
+        cv2.imwrite(os.path.join(pasta, f"{nome}_npc.png"), molde_npc)
     pasta_ex = os.path.join(pasta, f"{nome}_exemplos")
     if os.path.isdir(pasta_ex):  # ensino refeito com o mesmo nome: nada do anterior fica
         shutil.rmtree(pasta_ex)
@@ -397,3 +450,109 @@ def marcar_candidatos(img, perfil, exemplos=()):
     for _, pos in exemplos:
         cv2.drawMarker(out, tuple(map(int, pos)), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 16, 2)
     return out
+
+
+# ---------- Sessão de ensino ----------
+class Ensino:
+    """Junta exemplos (quadro, ponto) e o molde do texto; reaprende a cada exemplo."""
+
+    def __init__(self, nome, nome_jogo, espera_loot, osso="Big bones"):
+        self.nome, self.nome_jogo = nome, nome_jogo
+        self.espera_loot, self.osso = espera_loot, osso
+        self.molde = None
+        self.exemplos = []
+        self.faixas = []
+        self.perfil = None
+
+    def adicionar(self, img, pos, faixa):
+        """Novo exemplo. Devolve uma mensagem para o usuário."""
+        if not visao.dentro_do_jogo(pos) or visao.na_interface(pos):
+            return "exemplo recusado: o mouse está fora da área do jogo (ponha-o em cima do monstro)"
+        molde, motivo = gerar_molde_texto(faixa)
+        if molde is None:
+            return f"exemplo recusado: {motivo}"
+        if visao.achar_nome_acima(img, pos) is None:  # com o nome do NPC na tela a cor não decide
+            motivo = checar_exemplo(img, pos)
+            if motivo is not None:
+                return f"exemplo recusado: {motivo}"
+        if self.molde is None:
+            self.molde = molde
+        elif score_molde(faixa, self.molde) < LIMIAR_TEXTO_APRENDIDO:
+            return "exemplo recusado: o texto não é o do mesmo monstro do 1º exemplo"
+        self.exemplos.append((img, (int(pos[0]), int(pos[1]))))
+        perfil = montar_perfil(self.nome_jogo, self.molde, self.exemplos, self.espera_loot,
+                               osso=self.osso)
+        if perfil is None:
+            self.exemplos.pop()
+            if not self.exemplos:
+                self.molde = None
+            return "exemplo recusado: não achei a cor do corpo nesse ponto (mouse na borda?)"
+        self.perfil = perfil
+        if not any(f is faixa for f in self.faixas):
+            self.faixas.append(faixa)
+        aviso = ""
+        if len(self.exemplos) > 1 and min(np.hypot(pos[0] - p[0], pos[1] - p[1])
+                                          for _, p in self.exemplos[:-1]) <= 25:
+            aviso = " (mesmo lugar de um exemplo anterior: ensine OUTROS monstros, de preferência os que ficaram sem círculo)"
+        return self.resumo() + aviso
+
+    def desfazer(self):
+        """Tira o último exemplo e reaprende com os que sobraram."""
+        if not self.exemplos:
+            return "nada para desfazer"
+        self.exemplos.pop()
+        if len(self.faixas) > len(self.exemplos):
+            self.faixas.pop()
+        if not self.exemplos:
+            self.molde, self.perfil, self.faixas = None, None, []
+            return "exemplo desfeito: nenhum exemplo agora"
+        self.perfil = montar_perfil(self.nome_jogo, self.molde, self.exemplos, self.espera_loot,
+                                    osso=self.osso)
+        return "exemplo desfeito; " + self.resumo()
+
+    def perfil_visao(self):
+        """O perfil no formato de visao.PERFIS, para detectar com ele."""
+        p = self.perfil
+        pv = {"cor": (np.array(p["cor"][0]), np.array(p["cor"][1])),
+              "area": tuple(p["area"]), "fechar": p["fechar"], "desloc_matiz": p.get("desloc_matiz", 0)}
+        if p.get("nome_npc"):
+            pv["nome_npc"] = (p["_molde_npc"], tuple(p["nome_npc"]["desloc"]), p["nome_npc"]["limiar"])
+        return pv
+
+    def acha(self, img, pos, raio=30, candidatos=None):
+        """O perfil atual acha um monstro a até `raio` px (em x e em y) de `pos` em `img`?
+        `candidatos`: o detectar_sapos de `img` já feito (para não detectar de novo)."""
+        if candidatos is None:
+            candidatos = visao.detectar_sapos(img, self.perfil_visao())
+        return any(abs(s["pos"][0] - pos[0]) <= raio and abs(s["pos"][1] - pos[1]) <= raio
+                   for s in candidatos)
+
+    def resumo(self):
+        pv = self.perfil_visao()
+        partes = []
+        for img, pos in self.exemplos:
+            c = visao.detectar_sapos(img, pv)
+            achou = self.acha(img, pos, candidatos=c)
+            partes.append(f"{len(c)}{'' if achou else ' (este exemplo não foi achado!)'}")
+        p = self.perfil
+        if p.get("nome_npc"):
+            n = p["nome_npc"]
+            como = (f"pelo NOME em ciano (achado em {n['achados']} de {len(self.exemplos)} exemplo(s); "
+                    f"corpo {n['desloc'][1]} px abaixo do nome)")
+        else:
+            como = (f"pela cor HSV {p['cor'][0]}..{p['cor'][1]}, área {p['area'][0]}-{p['area'][1]} px "
+                    f"(sem nome de NPC em ciano na tela)")
+        return (f"{len(self.exemplos)} exemplo(s); candidatos por quadro: {', '.join(partes)}. "
+                f"Acha o monstro {como}; barra {p['barra']}, mira {p['raio_mira']} px")
+
+    def conferir(self):
+        """Grava perfis/<nome>_conferir.png com os candidatos do último quadro marcados."""
+        os.makedirs(visao.PASTA_PERFIS, exist_ok=True)
+        img = self.exemplos[-1][0]
+        out = marcar_candidatos(img, self.perfil_visao(), [e for e in self.exemplos if e[0] is img])
+        caminho = os.path.join(visao.PASTA_PERFIS, f"{self.nome}_conferir.png")
+        cv2.imwrite(caminho, out)
+        return caminho
+
+    def salvar(self):
+        return salvar_perfil(self.nome, self.perfil, self.molde, self.exemplos, self.faixas)

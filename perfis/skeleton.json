@@ -1,0 +1,47 @@
+{
+  "nome": "Skeleton",
+  "cor": [
+    [
+      0,
+      13,
+      26
+    ],
+    [
+      121,
+      32,
+      145
+    ]
+  ],
+  "area": [
+    123,
+    1976
+  ],
+  "fechar": 5,
+  "espera_loot": 4.5,
+  "loot_menu": true,
+  "osso": null,
+  "desloc_matiz": 0,
+  "texto": {
+    "limiar": 0.95,
+    "altura": 24,
+    "largura": 220,
+    "molde": "skeleton_texto.png"
+  },
+  "aprendido": {
+    "exemplos": 2,
+    "area_ref": 494.0,
+    "caixa_ref": [
+      32,
+      31
+    ],
+    "vazamento": 0.00129
+  },
+  "barra": [
+    45,
+    62,
+    19
+  ],
+  "raio_mira": 70,
+  "area_mira": 124,
+  "exemplos": "skeleton_exemplos"
+}

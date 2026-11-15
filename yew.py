@@ -177,7 +177,7 @@ def cortar(nome):
         if not (20 <= p[0] < 1860 and 60 <= p[1] < 1150):
             continue
         tela.mover(p)
-        chave, lat, scores = tela.esperar_texto(["yew"])
+        chave, lat, scores, _ = tela.esperar_texto(["yew"])
         if chave is None:
             continue
         clique = tela.clicar_conferindo(p)
@@ -205,7 +205,7 @@ def depositar():
     for dx, dy in [(0, 0), (8, 5), (-8, -10), (15, -15), (0, -40), (0, 20)]:
         p = (visao.JOGADOR[0] + CABINE_NA_TELA[0] + dx, visao.JOGADOR[1] + CABINE_NA_TELA[1] + dy)
         tela.mover(p)
-        chave, _, _ = tela.esperar_texto(["banco"], 0.35)
+        chave, *_ = tela.esperar_texto(["banco"], 0.35)
         if chave is None:
             continue
         tela.clicar_conferindo(p)

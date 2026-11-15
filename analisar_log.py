@@ -2,6 +2,7 @@
 
 Uso:  python analisar_log.py [logs/sessao_X.jsonl]   (sem argumento: a mais recente)
 """
+import collections
 import glob
 import json
 import os
@@ -23,31 +24,59 @@ def pct(valores, ps=(50, 90, 100)):
     return " / ".join(f"{np.percentile(valores, p):.2f}" for p in ps)
 
 
-def tempo_em_foco(eventos):
-    """Segundos da sessão com o jogo em primeiro plano."""
-    if not eventos:
-        return 0.0
-    fim = eventos[-1]["t"]
-    total, desde = 0.0, 0.0
+def intervalos(eventos, liga, desliga, ligado=False):
+    """[(início, fim)] em que o estado ficou ligado: de `liga(e)` até `desliga(e)` (ou o fim
+    da sessão). `ligado`: a sessão (t = 0) começa ligada."""
+    ivs, desde = [], (0.0 if ligado else None)
     for e in eventos:
-        if e["ev"] == "foco":
-            if not e["ok"] and desde is not None:
-                total += e["t"] - desde
-                desde = None
-            elif e["ok"]:
-                desde = e["t"]
-    if desde is not None:
-        total += fim - desde
-    return total
+        if desde is None and liga(e):
+            desde = e["t"]
+        elif desde is not None and desliga(e):
+            ivs.append((desde, e["t"]))
+            desde = None
+    if desde is not None and eventos:
+        ivs.append((desde, eventos[-1]["t"]))
+    return ivs
+
+
+def subtrair(ivs, tirar):
+    """Os intervalos `ivs` sem as partes que caem em algum de `tirar`."""
+    out = []
+    for a, b in ivs:
+        for c, d in sorted(tirar):
+            if d <= a or c >= b:
+                continue
+            if c > a:
+                out.append((a, c))
+            a = max(a, d)
+        if a < b:
+            out.append((a, b))
+    return out
+
+
+def dentro(a, b, ivs):
+    """Segundos de [a, b] que caem nos intervalos `ivs`."""
+    return sum(max(0.0, min(b, d) - max(a, c)) for c, d in ivs)
 
 
 def resumir(eventos):
     por = {}
     for e in eventos:
         por.setdefault(e["ev"], []).append(e)
-    ativo = tempo_em_foco(eventos)
+    # Tempo ativo: o jogo em primeiro plano, fora das pausas por vida baixa (o bot fica parado
+    # esperando a vida voltar; a luta em andamento seguia contando e passava de 100%).
+    em_foco = intervalos(eventos, lambda e: e["ev"] == "foco" and e["ok"],
+                         lambda e: e["ev"] == "foco" and not e["ok"], ligado=True)
+    pausas = intervalos(eventos, lambda e: e["ev"] == "vida_baixa", lambda e: e["ev"] == "vida_ok")
+    ativos = subtrair(em_foco, pausas)
+    foco = sum(b - a for a, b in em_foco)
+    ativo = sum(b - a for a, b in ativos)
     minutos = max(ativo / 60, 1e-9)
-    print(f"Duração em foco: {ativo:.0f}s ({minutos:.1f} min)   [p50 / p90 / máx]")
+    if pausas:
+        print(f"Duração em foco: {foco:.0f}s; pausado por vida: {foco - ativo:.0f}s; "
+              f"ativo: {ativo:.0f}s ({minutos:.1f} min)   [p50 / p90 / máx]")
+    else:
+        print(f"Duração em foco: {ativo:.0f}s ({minutos:.1f} min)   [p50 / p90 / máx]")
 
     atk = por.get("atacar", [])
     ok_atk = [e for e in atk if e["ok"]]
@@ -80,7 +109,9 @@ def resumir(eventos):
           f"{len(por.get('sapo_ocupado', []))}")
 
     fim = por.get("fim_combate", [])
-    print(f"\nLutas terminadas: {len(fim)}  duração (s): {pct([e['dur'] for e in fim])}")
+    # a luta [t - dur, t] sem a parte pausada por vida baixa
+    dur_luta = [e["dur"] - dentro(e["t"] - e["dur"], e["t"], pausas) for e in fim]
+    print(f"\nLutas terminadas: {len(fim)}  duração (s): {pct(dur_luta)}")
     print(f"  estados no fim: { {s: sum(e['estado'] == s for e in fim) for s in ('morto', 'livre')} }")
     print(f"  lutas não iniciadas pelo bot: {len(por.get('combate_externo', []))}")
 
@@ -90,29 +121,30 @@ def resumir(eventos):
           f"{pct([e['lat'] for e in ok_loot])}")
 
     hs = por.get("hover_sapo", [])
-    print(f"\nHover em candidatos a sapo: {len(hs)}")
-    for texto in ("giant", "hillgiant", None):
+    print(f"\nHover em candidatos a monstro: {len(hs)}")
+    textos = sorted({e["texto"] for e in hs}, key=str)  # o molde lido (perfil_<nome> nos aprendidos)
+    largura = max((len(str(t)) for t in textos), default=5)
+    for texto in textos:
         g = [e for e in hs if e["texto"] == texto]
-        if not g:
-            continue
-        print(f"  {str(texto):5}: {len(g):3}  área: {pct([e['area'] for e in g], (0, 50, 100))}  "
+        print(f"  {str(texto):{largura}}: {len(g):3}  área: {pct([e['area'] for e in g], (0, 50, 100))}  "
               f"latência: {pct([e['lat'] for e in g])}")
         if texto is None:
-            print(f"         melhor score giant: {pct([e.get('score', e.get('giant', 0)) for e in g])}  "
-                  f"big: {pct([e.get('big', 0) for e in g])}")
+            print(f"  {'':{largura}}  melhor score: {pct([e.get('score', e.get('giant', 0)) for e in g])}")
     aceitos = [e for e in hs if e["texto"] is not None]
     if aceitos:
-        print(f"  score giant quando aceito (mín/p50): {pct([e.get('score', e.get('giant', 0)) for e in aceitos], (0, 50))}")
+        print(f"  score quando aceito (mín/p50): "
+              f"{pct([e.get('score', e.get('giant', 0)) for e in aceitos], (0, 50))}")
 
     ho = por.get("hover_osso", [])
     ok_ho = [e for e in ho if e["ok"]]
-    print(f"\nHover em ossos: {len(ho)}  confirmados: {len(ok_ho)}")
-    print(f"  latência do texto (s): {pct([e['lat'] for e in ok_ho])}")
-    print(f"  score do rótulo confirmado (mín/p50): {pct([e['score_rotulo'] for e in ok_ho], (0, 50))}")
-    rej = [e for e in ho if not e["ok"]]
-    if rej:
-        print(f"  rejeitados: score rótulo {pct([e['score_rotulo'] for e in rej], (0, 50, 100))}  "
-              f"texto {pct([e['score_texto'] for e in rej], (0, 50, 100))}")
+    if ho:
+        print(f"\nHover em ossos: {len(ho)}  confirmados: {len(ok_ho)}")
+        print(f"  latência do texto (s): {pct([e['lat'] for e in ok_ho])}")
+        print(f"  score do rótulo confirmado (mín/p50): {pct([e['score_rotulo'] for e in ok_ho], (0, 50))}")
+        rej = [e for e in ho if not e["ok"]]
+        if rej:
+            print(f"  rejeitados: score rótulo {pct([e['score_rotulo'] for e in rej], (0, 50, 100))}  "
+                  f"texto {pct([e['score_texto'] for e in rej], (0, 50, 100))}")
 
     pg = por.get("pegar_osso", [])
     ok_pg = [e for e in pg if e["ok"]]
@@ -127,12 +159,37 @@ def resumir(eventos):
         if g:
             print(f"  via {via}: {sum(e['ok'] for e in g)}/{len(g)}  "
                   f"latência (s): {pct([e['lat'] for e in g if e['ok']])}")
+
+    # Runas e moedas (main.ColetaChao): falha sem 'motivo' = o inventário não mudou
+    coletas = {item: por.get(f"pegar_{item}", []) for item in ("runa", "moedas")}
+    extras = {nome: por.get(nome, []) for nome in ("mira_perdida", "menu_procura", "clique_cancelado")}
+    if any(coletas.values()) or any(extras.values()):
+        print("\nItens do chão:")
+        for item, plural in (("runa", "runas"), ("moedas", "moedas")):
+            g = coletas[item]
+            if not g:
+                continue
+            ok = [e for e in g if e["ok"]]
+            falhas = collections.Counter(e.get("motivo", "inventario_igual") for e in g if not e["ok"])
+            pausas_item = len(por.get(f"{plural}_pausa", []))
+            print(f"  {plural}: {len(ok)}/{len(g)}  ({len(ok) / minutos:.2f}/min)  clique -> inventário (s): "
+                  f"{pct([e['lat'] for e in ok])}  falhas: {dict(falhas) or 0}"
+                  + (f"  pausas: {pausas_item}" if pausas_item else ""))
+        mp = extras["mira_perdida"]
+        print(f"  mira perdida (a tela não parou): {len(mp)}"
+              + (f" {dict(collections.Counter(e.get('item') for e in mp))}" if mp else ""))
+        mpr = extras["menu_procura"]
+        print(f"  procura do \"Take\" com o mouse: {sum(bool(e['achou']) for e in mpr)}/{len(mpr)} acharam")
+        print(f"  cliques cancelados (sem foco ou o mouse mexido): {len(extras['clique_cancelado'])}")
+
     mn = por.get("menu", [])
     if mn:
-        achou = [e for e in mn if e["ok"]]
-        print(f"  menus abertos: {len(mn)}  com \"Take Big bones\": {len(achou)}  "
-              f"score: {pct([e['score'] for e in achou], (0, 50))}  "
-              f"latência (s): {pct([e['lat'] for e in achou])}")
+        print(f"\nMenus abertos: {len(mn)}  (com a linha \"Take\" / abertos)")
+        for item in sorted({e.get("item", "osso") for e in mn}, key=lambda i: (i != "osso", i)):
+            g = [e for e in mn if e.get("item", "osso") == item]  # os antigos, sem 'item', eram de osso
+            achou = [e for e in g if e["ok"]]
+            print(f"  {item:6}: {len(achou):3}/{len(g):3}  score (mín/p50): "
+                  f"{pct([e['score'] for e in achou], (0, 50))}  latência (s): {pct([e['lat'] for e in achou])}")
 
     en = por.get("enterrar", [])
     ok_en = [e for e in en if e["ok"]]
@@ -148,23 +205,24 @@ def resumir(eventos):
     if ci:
         print(f"\nCusto por ciclo (ms): captura {1000 * np.median([e['captura'] for e in ci]):.0f}  "
               f"rótulos {1000 * np.median([e['rotulos'] for e in ci]):.0f}  "
-              f"sapos {1000 * np.median([e['sapos'] for e in ci]):.0f}")
-        print(f"  ciclos sem nenhum candidato a sapo: {sum(e['n_sapos'] == 0 for e in ci)}/{len(ci)}")
+              f"monstros {1000 * np.median([e['sapos'] for e in ci]):.0f}")
+        print(f"  ciclos sem nenhum candidato a monstro: {sum(e['n_sapos'] == 0 for e in ci)}/{len(ci)}")
 
-    # Para onde vai o tempo
-    t_luta = sum(e["dur"] for e in fim)
+    # Para onde vai o tempo ativo
+    t_luta = sum(dentro(e["t"] - e["dur"], e["t"], ativos) for e in fim)
     t_atk = sum(e["lat"] for e in atk)
     t_loot = sum(e["lat"] for e in loot)
     t_pegar = sum(e["lat"] for e in pg)
+    t_itens = sum(e.get("lat", 0.0) for g in coletas.values() for e in g)
     t_ent = sum(e.get("lat", 0.0) for e in en if e.get("motivo") == "limite") + 0.25 * len(en)
     t_hover = sum(e["lat"] for e in hs) + sum(e["lat"] for e in ho)
-    print("\nDistribuição do tempo em foco:")
-    for nome, v in [("lutando", t_luta), ("indo até o sapo", t_atk),
-                    ("esperando loot", t_loot), ("pegando osso", t_pegar),
-                    ("enterrando", t_ent), ("conferindo texto", t_hover)]:
-        print(f"  {nome:18} {v:6.0f}s  {100 * v / max(ativo, 1e-9):4.0f}%")
-    resto = ativo - (t_luta + t_atk + t_loot + t_pegar + t_ent + t_hover)
-    print(f"  {'outros / ocioso':18} {resto:6.0f}s  {100 * resto / max(ativo, 1e-9):4.0f}%")
+    partes = [("lutando", t_luta), ("indo até o monstro", t_atk), ("esperando loot", t_loot),
+              ("pegando osso", t_pegar), ("pegando runa/moedas", t_itens), ("enterrando", t_ent),
+              ("conferindo texto", t_hover)]
+    partes.append(("outros / ocioso", ativo - sum(v for _, v in partes)))
+    print("\nDistribuição do tempo ativo:")
+    for nome, v in partes:
+        print(f"  {nome:19} {v:6.0f}s  {100 * v / max(ativo, 1e-9):4.0f}%")
 
 
 if __name__ == "__main__":

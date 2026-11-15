@@ -5,6 +5,7 @@ Ficam separadas do bot para poderem ser testadas offline com frames salvos
 """
 import json
 import os
+import re
 
 import cv2
 import numpy as np
@@ -63,10 +64,24 @@ INVENTARIO = (1570, 780, 1880, 1125)
 # Também sem as 10 linhas de cima: ali aparece o realce da aba do painel (visto em 15/11: 14 de
 # 18 "coletas" confirmadas rápido demais eram só as linhas 780-787 mudando, não um item).
 INVENTARIO_ITENS = (INVENTARIO[0] + 14, INVENTARIO[1] + 10, INVENTARIO[2] - 14, INVENTARIO[3])
+# Ícone da mochila na barra de abas: com a aba aberta ele fica sobre fundo vermelho (147 px
+# vermelhos; com outra aba aberta, 0 — medido em 32 quadros). F9/F7/F10 do ensino trocam a aba.
+ABA_MOCHILA = (1706, 742, 1747, 784)
+ABA_MOCHILA_MIN = 60
+
+
+def mochila_aberta(img):
+    """A aba da mochila está aberta? (o bot lê o inventário para enterrar e conferir coletas)"""
+    r = recortar(img, ABA_MOCHILA).astype(np.int16)
+    b, g, v = r[:, :, 0], r[:, :, 1], r[:, :, 2]
+    return int(((v > 90) & (v > 2 * g) & (v > 2 * b) & (g < 70)).sum()) >= ABA_MOCHILA_MIN
+
+
 # Áreas onde não existe mundo 3D: candidatos ali são descartados
 AREAS_INTERFACE = [
     (1570, 740, 1940, 1170),  # inventário e abas
     (1600, 30, 1940, 290),  # minimapa e orbes
+    (1878, 290, 1940, 740),  # coluna de ícones à direita, entre o minimapa e a mochila
     (0, 950, 660, 1170),  # chat
     (0, 0, 1940, 40),  # barra de título
     (10, 60, 200, 125),  # painel do oponente
@@ -82,6 +97,8 @@ AREAS_INTERFACE = [
 # espera_loot: tempo máximo (s) para o osso aparecer depois da barra de vida zerar;
 # loot_menu: o monstro larga vários itens na mesma pilha, então o osso é pego direto
 # pelo menu de botão direito (sem conferir antes o texto de ação).
+# Aprendidos (carregar_perfil) também têm: osso (bool: pega Big bones?), desloc_matiz,
+# nome_npc ((molde, (dx, dy), limiar) ou None), area_ref, aprendido.
 PERFIS = {
     "sapo": {
         "nome": "Giant frog",
@@ -114,6 +131,13 @@ PERFIS = {
 PASTA_PERFIS = os.path.join(BASE_DIR, "perfis")
 
 
+def nome_arquivo(texto):
+    """Nome do jogo -> nome do arquivo do perfil: 'Moss giant' -> 'moss_giant' (perfis/<nome>.json).
+    Pode dar '' (texto sem letra nem número): quem chama recusa."""
+    nome = re.sub(r"[^a-z0-9_-]+", "_", texto.strip().lower()).strip("_")
+    return nome if re.search(r"[a-z0-9]", nome) else ""  # só "-": como o --monstro do main.py
+
+
 def perfis_disponiveis():
     """Nomes aceitos em --monstro: os embutidos e os aprendidos (perfis/<nome>.json)."""
     aprendidos = []
@@ -122,10 +146,45 @@ def perfis_disponiveis():
     return list(PERFIS) + [n for n in aprendidos if n not in PERFIS]
 
 
+# Moldes aprendidos sem os dígitos do nível: com o nível no molde, um monstro de mesmo nome e
+# outro nível ("Skeleton (level-22)" num perfil ensinado com level-25) ficava em 0,944-0,948
+# e nunca era atacado (visto ao vivo em 15/11). Sem os dígitos, nas 353 faixas salvas o
+# monstro certo dá >= 0,997 e qualquer outro texto <= 0,63; o "(level-" continua no molde,
+# então "Cow" ainda não aceita "Cow calf" (depois do nome vem " (level-", não " calf").
+LIMIAR_TEXTO_SEM_NIVEL = 0.93
+
+
+def cortar_nivel(molde):
+    """O molde do texto de ação até o '-' de "(level-N)", sem os dígitos e o ')'.
+
+    Acha o hífen entre os últimos glifos (colunas com tinta separadas por coluna vazia): um
+    traço de 1-3 px de altura, 3-8 px de largura, no meio da linha. Sem hífen (texto sem
+    nível), devolve o molde inteiro."""
+    t = molde > 100
+    cols = np.flatnonzero(t.any(axis=0))
+    if not len(cols):
+        return molde
+    glifos, ini, ant = [], cols[0], cols[0]
+    for c in cols[1:]:
+        if c - ant > 1:
+            glifos.append((ini, ant))
+            ini = c
+        ant = c
+    glifos.append((ini, ant))
+    linhas = np.flatnonzero(t.any(axis=1))
+    topo, base = linhas[0], linhas[-1]
+    for a, b in reversed(glifos[-6:]):  # "-NNN)": o hífen está entre os 6 últimos
+        r = np.flatnonzero(t[:, a:b + 1].any(axis=1))
+        if r[-1] - r[0] <= 2 and 3 <= b - a + 1 <= 8 and topo + 3 < r[0] < base - 3:
+            return molde[:, :b + 3].copy()
+    return molde
+
+
 def carregar_perfil(nome):
     """Perfil pelo nome: os embutidos (PERFIS) não mudam; senão lê perfis/<nome>.json, gerado
-    por ensinar.py, e registra o molde do texto de ação dele. KeyError se não existir;
-    ValueError (com o motivo) se o arquivo estiver incompleto ou estragado."""
+    por ensino.Ensino (F9 no main.py ou ensinar.py), e registra o molde do texto de ação dele.
+    KeyError se não existir; ValueError (com o motivo) se o arquivo estiver incompleto ou
+    estragado."""
     if nome in PERFIS:
         return PERFIS[nome]
     caminho = os.path.join(PASTA_PERFIS, f"{nome}.json")
@@ -147,19 +206,31 @@ def carregar_perfil(nome):
             "espera_loot": float(d.get("espera_loot", 4.5)),
             "loot_menu": bool(d.get("loot_menu", True)),
             # o bot só conhece "Big bones"; com osso nulo ele não pega nem enterra ossos e
-            # espera o loot por qualquer rótulo novo no chão (main.esperar_loot_rotulo)
+            # espera o loot por qualquer rótulo novo no chão (main.esperar_loot(..., osso=False))
             "osso": d.get("osso", "Big bones") is not None,
             "desloc_matiz": int(d.get("desloc_matiz", 0)),
             "aprendido": True,
+            "nome_npc": None,
+            "area_ref": float(d.get("aprendido", {}).get("area_ref", 0)),
         }
         limiar = float(d["texto"].get("limiar", 0.95))
+        npc = d.get("nome_npc")
+        if npc:  # ensinado com o nome do NPC em ciano na tela: acha o monstro por ele
+            tpl = cv2.imread(os.path.join(PASTA_PERFIS, npc["molde"]), cv2.IMREAD_GRAYSCALE)
+            if tpl is None:
+                raise ValueError(f"molde do nome do NPC não encontrado: {npc['molde']}")
+            perfil["nome_npc"] = (tpl, (int(npc["desloc"][0]), int(npc["desloc"][1])),
+                                  float(npc.get("limiar", NOME_NPC_LIMIAR)))
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as erro:
-        raise ValueError(f"{caminho}: campo faltando ou inválido ({erro!r}); refaça com ensinar.py") from erro
+        raise ValueError(f"{caminho}: campo faltando ou inválido ({erro!r})") from erro
     molde = cv2.imread(molde_arq, cv2.IMREAD_GRAYSCALE)
     if molde is None:
         raise ValueError(f"molde do texto não encontrado: {molde_arq}")
+    cortado = cortar_nivel(molde)
+    if cortado.shape[1] < molde.shape[1]:  # qualquer nível do monstro serve
+        molde, limiar = cortado, min(limiar, LIMIAR_TEXTO_SEM_NIVEL)
     TEXTOS[perfil["texto"]] = molde
-    MASCARA_TEXTO_CHAVE[perfil["texto"]] = mascara_texto_geral
+    TEXTO_NIVEL_QUALQUER_COR.add(perfil["texto"])
     LIMIAR_TEXTO_CHAVE[perfil["texto"]] = limiar
     PERFIS[nome] = perfil
     return perfil
@@ -194,21 +265,28 @@ def na_interface(pos):
 
 
 def picos(res, threshold, raio_x, raio_y, limite=30):
-    """Máximos locais distintos de um resultado de matchTemplate: [(x, y, score)]."""
-    res = res.copy()
+    """Máximos locais distintos de um resultado de matchTemplate: [(x, y, score)].
+
+    Escolha gulosa: a maior nota primeiro, e as vizinhas a até raio_x/raio_y dela ficam de
+    fora. Só olha os pontos >= threshold (poucos: no máximo 24 nas amostras), sem copiar nem
+    varrer o mapa inteiro a cada pico."""
+    # comparação no numpy: o cv2.compare dá erro num mapa 1x1 (molde do tamanho do recorte)
+    pts = cv2.findNonZero((res >= threshold).view(np.uint8))
+    if pts is None:
+        return []
+    xs, ys = pts[:, 0, 0], pts[:, 0, 1]
+    notas = res[ys, xs]
     pontos = []
-    while len(pontos) < limite:
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val < threshold:
+    for i in np.argsort(-notas, kind="stable"):  # empate: o 1º na ordem de linha, como o minMaxLoc
+        s = float(notas[i])
+        if s < threshold:  # a comparação acima arredonda o limiar para float32: confere em double
             break
-        pontos.append((max_loc[0], max_loc[1], float(max_val)))
-        cv2.rectangle(
-            res,
-            (max_loc[0] - raio_x, max_loc[1] - raio_y),
-            (max_loc[0] + raio_x, max_loc[1] + raio_y),
-            -1.0,
-            -1,
-        )
+        x, y = int(xs[i]), int(ys[i])
+        if any(abs(x - px) <= raio_x and abs(y - py) <= raio_y for px, py, _ in pontos):
+            continue
+        pontos.append((x, y, s))
+        if len(pontos) >= limite:
+            break
     return pontos
 
 
@@ -234,52 +312,45 @@ def casar_rotulo(mask, tpl):
 
 
 # ---------- Texto de ação ----------
-def mascara_texto(img):
+def mascara_texto(img, nivel_qualquer_cor=False):
     """Pixels com as cores do texto de ação: branco, amarelo (NPC), verde-limão (nível),
-    laranja (item) e ciano (objeto do cenário)."""
-    b, g, r = (img[:, :, i].astype(np.int16) for i in range(3))
-    branco = (r > 200) & (g > 200) & (b > 200)
-    amarelo = (r > 200) & (g > 200) & (b < 90)
-    verde = (r < 90) & (g > 200) & (b < 90)
-    laranja = (r > 200) & (g > 100) & (g < 190) & (b < 110)
-    ciano = (r < 90) & (g > 200) & (b > 200)
-    m = (branco | amarelo | verde | laranja | ciano).astype(np.uint8) * 255
-    return cv2.GaussianBlur(m, (3, 3), 0)
+    laranja (item) e ciano (objeto do cenário).
 
-
-def mascara_texto_geral(img):
-    """Como mascara_texto, mas aceita o nível do monstro em qualquer cor: o jogo pinta o
+    `nivel_qualquer_cor`: aceita o nível do monstro em qualquer cor (o jogo pinta o
     "(level-N)" de verde, amarelo-esverdeado, laranja ou vermelho conforme a diferença de
-    nível. Usada nos moldes aprendidos (perfis/*.json)."""
+    nível). Usada nos moldes aprendidos (perfis/*.json)."""
     b, g, r = (img[:, :, i].astype(np.int16) for i in range(3))
     branco = (r > 200) & (g > 200) & (b > 200)
-    quente = (np.maximum(r, g) > 200) & (b < 90)  # amarelo, verdes, laranjas, vermelho
+    if nivel_qualquer_cor:
+        nivel = (np.maximum(r, g) > 200) & (b < 90)  # amarelo, verdes, laranjas, vermelho
+    else:
+        nivel = ((r > 200) | (r < 90)) & (g > 200) & (b < 90)  # amarelo ou verde
     laranja = (r > 200) & (g > 100) & (g < 190) & (b < 110)
     ciano = (r < 90) & (g > 200) & (b > 200)
-    m = (branco | quente | laranja | ciano).astype(np.uint8) * 255
+    m = (branco | nivel | laranja | ciano).astype(np.uint8) * 255
     return cv2.GaussianBlur(m, (3, 3), 0)
 
 
-# Moldes aprendidos (carregar_perfil) usam outra máscara e um limiar próprio
-MASCARA_TEXTO_CHAVE = {}
+# Moldes aprendidos (carregar_perfil): nível em qualquer cor e um limiar próprio
+TEXTO_NIVEL_QUALQUER_COR = set()
 LIMIAR_TEXTO_CHAVE = {}
 
 
-def score_texto(faixa, chave):
-    """Semelhança (0-1) entre a faixa do texto de ação e o template `chave`."""
-    tpl = TEXTOS[chave]
-    m = MASCARA_TEXTO_CHAVE.get(chave, mascara_texto)(faixa)
+def nota_molde(faixa, tpl, nivel_qualquer_cor=False):
+    """Semelhança (0-1) entre a faixa do texto de ação e o molde `tpl` (0 se não couber)."""
+    m = mascara_texto(faixa, nivel_qualquer_cor)
     if m.shape[0] < tpl.shape[0] or m.shape[1] < tpl.shape[1]:
         return 0.0
     return float(cv2.matchTemplate(m, tpl, cv2.TM_CCOEFF_NORMED).max())
 
 
+def score_texto(faixa, chave):
+    """Semelhança (0-1) entre a faixa do texto de ação e o template `chave`."""
+    return nota_molde(faixa, TEXTOS[chave], chave in TEXTO_NIVEL_QUALQUER_COR)
+
+
 def limiar_texto(chave):
     return LIMIAR_TEXTO_CHAVE.get(chave, TEXTO_THRESHOLD)
-
-
-def faixa_texto(img):
-    return recortar(img, FAIXA_TEXTO_ACAO)
 
 
 # Só a palavra "Take" do texto de ação (do molde "Take Big bones"): diz se há um item do
@@ -471,7 +542,7 @@ def painel(img_painel):
 def estado_combate(img):
     """'livre' (sem painel), 'lutando' (oponente com vida) ou 'morto' (barra zerada).
 
-    O painel ainda fica alguns segundos na tela depois que o sapo morre, todo
+    O painel ainda fica alguns segundos na tela depois que o monstro morre, todo
     vermelho; sem verde o combate já acabou.
     """
     vermelho, verde = painel(recortar(img, PAINEL_OPONENTE))
@@ -480,16 +551,17 @@ def estado_combate(img):
     return "lutando" if verde > 50 else "morto"
 
 
-def fracao_vida_oponente(img):
-    vermelho, verde = painel(recortar(img, PAINEL_OPONENTE))
-    total = vermelho + verde
-    return verde / total if total > 1500 else None
-
-
-# ---------- Sapos ----------
+# ---------- Monstros ----------
 def detectar_sapos(img, perfil=None):
-    """Candidatos ao monstro do perfil pela cor: [{'pos': (x, y), 'area': a, 'caixa': (w, h)}]."""
+    """Candidatos ao monstro do perfil pela cor: [{'pos': (x, y), 'area': a, 'caixa': (w, h)}].
+    Perfil com nome do NPC (cliente com "NPC Highlights"): pelo nome em ciano (detectar_por_nome)."""
     perfil = perfil or PERFIS["sapo"]
+    if perfil.get("nome_npc") is not None:
+        m = mascara_nome_npc(img)  # uma vez só: serve aos dois
+        achados = detectar_por_nome(img, perfil, mascara=m)
+        # sem nenhum nome em ciano na tela ("NPC Highlights" desligado): a cor de reserva
+        if achados or perfil["area"][1] <= 0 or ha_nomes_npc(img, m):
+            return achados
     mask = mascara_monstro(img, perfil)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     sapos = []
@@ -509,12 +581,21 @@ def detectar_sapos(img, perfil=None):
 
 
 def sapo_mais_proximo(img_local, ponto, perfil=None):
-    """Centro do sapo mais perto de `ponto` num recorte pequeno (coordenadas do recorte).
+    """Centro do monstro mais perto de `ponto` num recorte pequeno (coordenadas do recorte).
 
-    Usado para corrigir a mira logo antes do clique: o sapo anda, e a posição do
+    Usado para corrigir a mira logo antes do clique: o monstro anda, e a posição do
     ciclo já tem ~250 ms quando o texto de ação é confirmado.
     """
     perfil = perfil or PERFIS["sapo"]
+    if perfil.get("nome_npc") is not None:
+        m = mascara_nome_npc(img_local)
+        achados = [s["pos"] for s in detectar_por_nome(img_local, perfil, interface=False, mascara=m)]
+        if achados:
+            p = min(achados, key=lambda q: np.hypot(q[0] - ponto[0], q[1] - ponto[1]))
+            return p, float(np.hypot(p[0] - ponto[0], p[1] - ponto[1]))
+        if perfil["area"][1] <= 0 or cv2.countNonZero(m):
+            return None, None  # nomes ligados e nenhum é o dele: não corrige a mira
+        # sem nomes no recorte: a cor de reserva (abaixo)
     mask = mascara_monstro(img_local, perfil)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     melhor, melhor_d = None, None
@@ -529,6 +610,120 @@ def sapo_mais_proximo(img_local, ponto, perfil=None):
         if melhor_d is None or d < melhor_d:
             melhor, melhor_d = p, d
     return melhor, melhor_d
+
+
+# ---------- Nome do NPC em ciano ----------
+# Com "NPC Highlights" ligado no cliente oficial, cada NPC mostra o nome em ciano (BGR ~ (248,
+# 248, 5)) em cima da cabeça. Nada do cenário tem essa cor, e o texto separa um monstro do
+# outro ("Moss giant" x "Zombie"): no poço dos Moss giants (chão, pedras e muros da mesma cor
+# do musgo), os 5 gigantes da tela tinham o nome e nada mais em volta era ciano.
+NOME_NPC_LIMIAR = 0.7  # nota do molde do nome (o nome encavalado no de outro NPC cai um pouco)
+NOME_NPC_BUSCA = (150, 15, 320)  # o nome do monstro ensinado: |dx| <= 150 e 15 <= dy <= 320 px acima do clique
+NOME_NPC_BLUR = (3, 3)
+
+
+MASCARA_NOME_PX_MAX = 100000  # acima disso, o |B-G| no quadro inteiro sai mais barato
+
+
+def mascara_nome_npc(img):
+    """Pixels do nome de NPC em ciano (0/255): R baixo, G e B altos e parecidos (água e céu
+    azulados têm B bem maior que G). O |B-G| só é conferido nos pixels que passaram na 1ª
+    faixa (mediana de 82 nas amostras): ~2,5x mais rápido que no quadro inteiro."""
+    m = cv2.inRange(img, (150, 150, 0), (255, 255, 110))
+    n = cv2.countNonZero(m)
+    if not n:
+        return m
+    if n > MASCARA_NOME_PX_MAX:  # cena muito azul-esverdeada
+        b, g = cv2.split(img)[:2]
+        return cv2.bitwise_and(m, cv2.inRange(cv2.absdiff(b, g), 0, 39))
+    pts = cv2.findNonZero(m)
+    xs, ys = pts[:, 0, 0], pts[:, 0, 1]
+    px = img[ys, xs].astype(np.int16)
+    ruim = np.abs(px[:, 0] - px[:, 1]) > 39
+    m[ys[ruim], xs[ruim]] = 0
+    return m
+
+
+NOME_NPC_ALTURA_MAX = 22  # px da linha de nome dilatada (uma linha mede ~20); mais = dois nomes encavalados
+
+
+def achar_nome_acima(img, pos):
+    """(x, y, w, h) da linha de nome em ciano do monstro sob `pos` (o mouse no ensino), ou None.
+
+    O nome fica centrado sobre a cabeça e o corpo quase na vertical abaixo dele: escolhe pelo
+    custo 4*|dx| + dy, não pela distância em linha reta (que pegava o nome de um NPC vizinho,
+    visto na revisão: 35 erros em 210 pontos do gigante de cima). O mouse pode estar logo abaixo
+    do nome (na cabeça): aceita o centro do nome até meia linha abaixo do mouse. Linha com duas
+    alturas (nomes encavalados) não serve: o molde sairia com os dois nomes."""
+    m = mascara_nome_npc(img)
+    linhas = cv2.dilate(m, np.ones((3, 9), np.uint8))
+    _, _, st, _ = cv2.connectedComponentsWithStats(linhas, connectivity=8)
+    melhor, melhor_c = None, None
+    for x, y, w, h, _ in st[1:]:
+        if w < 20 or h > NOME_NPC_ALTURA_MAX or na_interface((x + w // 2, y + h // 2)):
+            continue
+        dx, dy = pos[0] - (x + w / 2), pos[1] - (y + h / 2)
+        if abs(dx) > NOME_NPC_BUSCA[0] or not -h / 2 <= dy <= NOME_NPC_BUSCA[2]:
+            continue
+        c = 4 * abs(dx) + dy
+        if melhor_c is None or c < melhor_c:
+            melhor, melhor_c = (int(x), int(y), int(w), int(h)), c
+    return melhor
+
+
+NOMES_NPC_MIN_PX = 100  # pixels ciano fora da interface: abaixo disso, a tela não tem nomes de NPC
+
+
+def ha_nomes_npc(img, mascara=None):
+    """A tela mostra nomes de NPC em ciano? (Sem "NPC Highlights" ligado, não: o perfil pelo
+    nome cai na cor.) `img`: quadro inteiro; `mascara`: mascara_nome_npc(img), se já calculada
+    (não é alterada)."""
+    m = mascara_nome_npc(img) if mascara is None else mascara.copy()
+    for x1, y1, x2, y2 in AREAS_INTERFACE:
+        m[y1:y2, x1:x2] = 0
+    return cv2.countNonZero(m) >= NOMES_NPC_MIN_PX
+
+
+def molde_nome_npc(img, caixa):
+    """Molde (borrado, como os rótulos do chão) do nome dentro de `caixa` (achar_nome_acima)."""
+    x, y, w, h = caixa
+    m = mascara_nome_npc(img)[max(y - 2, 0):y + h + 2, max(x - 2, 0):x + w + 2]
+    return cv2.GaussianBlur(m, NOME_NPC_BLUR, 0)
+
+
+def detectar_por_nome(img, perfil, interface=True, mascara=None):
+    """Candidatos pelo nome do NPC: o centro do nome mais o deslocamento até o corpo, aprendido
+    no ensino. Mesmo formato de detectar_sapos; 'nome' = centro do nome achado.
+    `interface=False`: `img` é um recorte (não filtra pelas áreas da interface).
+    `mascara`: mascara_nome_npc(img), se já calculada (não é alterada)."""
+    tpl, (dx, dy), limiar = perfil["nome_npc"]
+    m = mascara_nome_npc(img) if mascara is None else mascara
+    th, tw = tpl.shape[:2]
+    H, W = m.shape[:2]
+    if H < th or W < tw or not cv2.countNonZero(m):
+        return []
+    # só em volta de cada grupo de pixels ciano (a tela quase não tem ciano): ~5x mais rápido
+    # que o quadro inteiro
+    _, _, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(m, np.ones((5, 15), np.uint8)), connectivity=8)
+    vistos = []
+    for x0, y0, w0, h0, _ in st[1:]:
+        x1, y1 = max(x0 - tw, 0), max(y0 - th, 0)
+        x2, y2 = min(x0 + w0 + tw, W), min(y0 + h0 + th, H)
+        if x2 - x1 < tw or y2 - y1 < th:
+            continue
+        reg = cv2.GaussianBlur(m[y1:y2, x1:x2], NOME_NPC_BLUR, 0)
+        for x, y, score in picos(cv2.matchTemplate(reg, tpl, cv2.TM_CCOEFF_NORMED), limiar, tw // 2, th // 2):
+            c = (x1 + x + tw // 2, y1 + y + th // 2)
+            if all(abs(c[0] - v[0]) > tw // 2 or abs(c[1] - v[1]) > th // 2 for v, _ in vistos):
+                vistos.append((c, score))
+    achados = []
+    for nome, score in vistos:
+        pos = (int(nome[0] + dx), int(nome[1] + dy))
+        if interface and (na_interface(nome) or na_interface(pos) or nome[1] < FAIXA_TEXTO_ACAO[3]):
+            continue
+        achados.append({"pos": pos, "area": int(perfil.get("area_ref", 0)), "caixa": (int(tw), int(th)),
+                        "nome": nome, "score": round(score, 3)})
+    return achados
 
 
 def barra_vida_perto(img, pos, largura=45, acima=85, abaixo=10):
@@ -560,18 +755,17 @@ def mascara_rotulos(img):
     return m > 0, cv2.GaussianBlur(m, ROTULO_BLUR, 0)
 
 
-def detectar_ossos_chao(img, threshold=None, origem=(0, 0), mascara=None):
+def detectar_ossos_chao(img, origem=(0, 0), mascara=None):
     """Ossos no chão a partir do rótulo 'Big bones': [{'pos': (x, y), 'score': s}].
 
     `img` pode ser um recorte da janela; nesse caso `origem` é o canto dele, e as
     posições devolvidas continuam em coordenadas da janela. `mascara`: o resultado de
     mascara_rotulos(img), se já tiver sido calculado.
     """
-    threshold = ROTULO_THRESHOLD if threshold is None else threshold
     _, mask = mascara_rotulos(img) if mascara is None else mascara
     res = casar_rotulo(mask, ROTULO_OSSO)
     ossos = []
-    for x, y, score in picos(res, threshold, 40, 12):
+    for x, y, score in picos(res, ROTULO_THRESHOLD, 40, 12):
         pos = (
             origem[0] + x + ROTULO_OFFSET_OSSO[0],
             origem[1] + y + ROTULO_OFFSET_OSSO[1],
@@ -610,10 +804,6 @@ ITENS_CHAO = {
         "menu_limiar": 0.85, "menu_altura_x": None, "menu_colunas": None,
     },
 }
-# Nomes antigos (testes e quem calibrou as runas)
-ROTULO_RUNA = ITENS_CHAO["runa"]["rotulo"]
-RUNA_ALTURA_X, RUNA_COLUNAS = ITENS_CHAO["runa"]["altura_x"], ITENS_CHAO["runa"]["colunas"]
-MENU_RUNA = ITENS_CHAO["runa"]["menu"]
 ROTULO_ENTRE_LINHAS = 22  # px entre rótulos empilhados sobre a mesma pilha
 ROTULO_ITEM = (-3, 23)  # do centro/topo do rótulo de baixo da pilha até o item (medido nos ossos)
 ROTULO_MAX_PILHA = 8
@@ -817,10 +1007,6 @@ def detectar_itens_chao(img, item, origem=(0, 0), ossos=None, mascara=None):
     return achados
 
 
-def detectar_runas_chao(img, origem=(0, 0), ossos=None, mascara=None):
-    return detectar_itens_chao(img, "runa", origem, ossos, mascara)
-
-
 # Linha "Take <item>" do menu de botão direito. "Take" medido em 45 menus: >= 0,87 nas
 # linhas certas e <= 0,71 no resto (inclusive "Examine").
 MENU_TAKE_PALAVRA = _carregar("menu_take_word_osrs.png", cinza=True)
@@ -872,10 +1058,6 @@ def menu_tem_take(img_regiao):
         return False
     res = cv2.matchTemplate(mascara_texto(img_regiao), MENU_TAKE_PALAVRA, cv2.TM_CCOEFF_NORMED)
     return float(res.max()) >= MENU_TAKE_THRESHOLD
-
-
-def achar_take_runa_no_menu(img_regiao):
-    return achar_take_item_no_menu(img_regiao, "runa")
 
 
 def detectar_ossos_inventario(img_inventario):
@@ -951,14 +1133,6 @@ PX_TILE = 50  # tamanho aproximado de um tile no zoom mínimo
 def ponto_tela(delta_tiles):
     """Ponto aproximado da janela onde aparece o tile a `delta_tiles` do jogador."""
     return (int(JOGADOR[0] + delta_tiles[0] * PX_TILE), int(JOGADOR[1] + delta_tiles[1] * PX_TILE))
-
-
-def visivel(pos, margem=25):
-    """O ponto está na área 3D da janela (fora da interface)?"""
-    x, y = pos
-    if not (margem <= x < 1880 - margem and 45 + margem <= y < 1160 - margem):
-        return False
-    return not na_interface(pos)
 
 
 # ---------- Inventário: slots ocupados ----------
