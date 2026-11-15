@@ -67,6 +67,7 @@ AREAS_INTERFACE = [
     (0, 950, 660, 1170),  # chat
     (0, 0, 1940, 40),  # barra de título
     (10, 60, 200, 125),  # painel do oponente
+    (1395, 35, 1570, 140),  # contador e gotas de XP (o ícone de punho tem cor de pele)
 ]
 
 
@@ -424,9 +425,14 @@ def barra_vida_perto(img, pos, largura=45, acima=85, abaixo=10):
 
 # ---------- Ossos ----------
 def mascara_rotulos(img):
-    """(texto branco dos rótulos do chão, mesma máscara desfocada para os moldes)."""
-    binm = img.min(axis=2) > ROTULO_BRILHO_MIN
-    return binm, cv2.GaussianBlur(binm.astype(np.uint8) * 255, ROTULO_BLUR, 0)
+    """(texto branco dos rótulos do chão, mesma máscara desfocada para os moldes).
+
+    Branco = os 3 canais acima de ROTULO_BRILHO_MIN. cv2.inRange dá o mesmo resultado de
+    img.min(axis=2) > ROTULO_BRILHO_MIN (conferido byte a byte em 244 quadros), ~10x
+    mais rápido (6 ms contra 63 ms na janela inteira).
+    """
+    m = cv2.inRange(img, (ROTULO_BRILHO_MIN + 1,) * 3, (255, 255, 255))
+    return m > 0, cv2.GaussianBlur(m, ROTULO_BLUR, 0)
 
 
 def detectar_ossos_chao(img, threshold=None, origem=(0, 0), mascara=None):

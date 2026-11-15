@@ -54,7 +54,7 @@ CLIQUE_TIMEOUT = 0.25
 
 # Menu de botão direito (pilhas de itens): meia largura/altura da área lida em volta do clique
 MENU_RAIO = (280, 330)
-MENU_TIMEOUT = 0.5
+MENU_TIMEOUT = 0.3  # medido em 479 menus certos: abrem em 0,066 s (p50), no máximo 0,174 s
 
 # Segurança: abaixo disso o bot para de atacar e avisa (ele não come nem foge)
 VIDA_MINIMA = 0.40
@@ -80,6 +80,9 @@ ESPERA_PEGAR_ITEM = 2.5  # + dist/150, como os ossos
 # não compensa a caminhada: com monstro na tela, mata o mais perto e pega o loot quando passar.
 COLETA_RAIO_PERTO = 280  # px: com monstro na tela, só pega loot até aqui
 COLETA_RAIO_MAX = 450  # px: sem monstro à vista, vai buscar até aqui
+# Recorte do quadro onde procurar o loot (recorte_loot): além do raio, a largura dos
+# rótulos para os lados, a pilha de rótulos acima e a pilha abaixo do rótulo
+LOOT_MARGEM_LADO, LOOT_MARGEM_ACIMA, LOOT_MARGEM_ABAIXO = 380, 230, 60
 COLETA_IGNORAR_SEG = 60.0  # pilha que falhou fica ignorada por esse tempo (as outras não)
 COLETA_IGNORAR_RAIO = 25  # px em volta da pilha que falhou
 COLETA_FALHAS_PAUSA = 3  # falhas seguidas -> deixa aquele item de lado por COLETA_PAUSA s
@@ -541,11 +544,13 @@ class ColetaChao:
     def ativas(self):
         return self.ligado and time.time() >= self.pausa_ate
 
-    def detectar(self, img, ossos=None, mascara=None, raio=COLETA_RAIO_MAX):
-        """Itens a até `raio` px do personagem, sem as pilhas que falharam há pouco."""
+    def detectar(self, img, ossos=None, mascara=None, raio=COLETA_RAIO_MAX, origem=(0, 0)):
+        """Itens a até `raio` px do personagem, sem as pilhas que falharam há pouco.
+
+        `img` pode ser um recorte da janela com canto em `origem` (ver recorte_loot)."""
         agora = time.time()
         self.ignoradas = [(p, t) for p, t in self.ignoradas if t > agora]
-        itens = visao.detectar_itens_chao(img, self.item, ossos=ossos, mascara=mascara)
+        itens = visao.detectar_itens_chao(img, self.item, origem=origem, ossos=ossos, mascara=mascara)
         return [i for i in itens if distancia(CENTRO, i["pos"]) <= raio
                 and not any(distancia(i["pos"], p) <= COLETA_IGNORAR_RAIO for p, _ in self.ignoradas)]
 
@@ -665,7 +670,9 @@ MOEDAS = ColetaChao("moedas", "moedas", "🪙", PEGAR_MOEDAS)
 COLETAS = (RUNAS, MOEDAS)
 
 
-def atacar_sapo(img, sapos):
+def atacar_sapo(img, sapos, t_quadro=None):
+    """Passa o mouse nos candidatos (mais perto primeiro) e ataca o 1º que o jogo confirmar.
+    `t_quadro`: perf_counter da captura de `img` (só para o log: idade do quadro no hover)."""
     candidatos = sorted(sapos, key=lambda s: distancia(CENTRO, s["pos"]))
     tentativas = 0
     for sapo in candidatos:
@@ -675,14 +682,16 @@ def atacar_sapo(img, sapos):
         dist = distancia(CENTRO, pos)
         barra = visao.barra_vida_perto(img, pos, *PERFIL["barra"])
         if barra >= BARRA_SAPO_OCUPADO:
-            LOG.ev("sapo_ocupado", dist=round(dist), barra=barra)
+            LOG.ev("sapo_ocupado", dist=round(dist), barra=barra, pos=[int(pos[0]), int(pos[1])])
             continue
         tentativas += 1
+        idade = None if t_quadro is None else round(time.perf_counter() - t_quadro, 3)
         mover(pos)
         chave, lat, scores, faixa = esperar_texto([PERFIL["texto"]])
         salvar_faixa(faixa, f"sapo-{chave}", scores)
         LOG.ev("hover_sapo", texto=chave, lat=round(lat, 3), dist=round(dist), area=sapo["area"],
-               caixa=sapo["caixa"], barra=barra, score=round(scores[PERFIL["texto"]], 3))
+               caixa=sapo["caixa"], barra=barra, score=round(scores[PERFIL["texto"]], 3),
+               pos=[int(pos[0]), int(pos[1])], idade=idade)
         if chave != PERFIL["texto"]:
             salvar_amostra(f"{NOME_PERFIL}_rej", img, pos, area=sapo["area"], texto=chave)
             continue
@@ -706,6 +715,16 @@ def atacar_sapo(img, sapos):
             salvar_amostra("ataque_falhou_depois", capturar(), pos, barra=barra)
         return ok
     return False
+
+
+def recorte_loot(raio):
+    """(x1, y1, x2, y2) da janela onde cabe todo rótulo de loot a até `raio` px do
+    personagem: os rótulos ficam acima da pilha (até 8 linhas de 22 px) e se estendem
+    para os lados. Conferido em 249 quadros, raios 280 e 450: mesmos achados que a janela
+    inteira (671 ossos, runas e moedas), em ~65% do tempo."""
+    return (max(CENTRO[0] - raio - LOOT_MARGEM_LADO, 0), max(CENTRO[1] - raio - LOOT_MARGEM_ACIMA, 0),
+            min(CENTRO[0] + raio + LOOT_MARGEM_LADO, tela.LARGURA),
+            min(CENTRO[1] + raio + LOOT_MARGEM_ABAIXO, tela.ALTURA))
 
 
 def esperar_loot(inicio):
@@ -896,12 +915,15 @@ def loop_principal():
         # Loot do chão: runas e moedas primeiro (valem mais e caem na mesma pilha), depois ossos
         coletas = [c for c in COLETAS if c.ativas()]
         if coletar or coletas:
-            mascara = visao.mascara_rotulos(img)
-            ossos = [o for o in visao.detectar_ossos_chao(img, mascara=mascara)
+            # só o recorte que pode ter loot dentro do raio (metade do tempo com raio 280)
+            x1, y1, x2, y2 = recorte_loot(raio)
+            sub = img[y1:y2, x1:x2]
+            mascara = visao.mascara_rotulos(sub)
+            ossos = [o for o in visao.detectar_ossos_chao(sub, origem=(x1, y1), mascara=mascara)
                      if distancia(CENTRO, o["pos"]) <= raio]
             agiu = False
             for coleta in coletas:
-                itens = coleta.detectar(img, ossos=ossos, mascara=mascara, raio=raio)
+                itens = coleta.detectar(sub, ossos=ossos, mascara=mascara, raio=raio, origem=(x1, y1))
                 if itens and coleta.pegar(img, itens):
                     agiu = True
                     break
@@ -916,7 +938,7 @@ def loop_principal():
         # Atacar o sapo mais próximo
         LOG.ev("ciclo", captura=round(t1 - t0, 4), rotulos=round(t4 - t3, 4),
                sapos=round(t3 - t2, 4), n_sapos=len(sapos))
-        if sapos and atacar_sapo(img, sapos):
+        if sapos and atacar_sapo(img, sapos, t0):
             for coleta in COLETAS:
                 coleta.ignoradas.clear()  # o personagem vai andar: as posições de tela mudam
             sapos_atacados += 1
