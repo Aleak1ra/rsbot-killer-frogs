@@ -100,6 +100,11 @@ INVENTARIO_DIF_TOM = 40
 INVENTARIO_DIF_PX = 6
 INVENTARIO_ESPERA_MIN = 0.25  # s após o clique antes de aceitar a mudança (filtra as passageiras)
 INVENTARIO_RAPIDA = 0.4  # coleta confirmada antes disso grava o inventário antes|depois (diagnóstico)
+# Depois de pegar um item, o rótulo da pilha ainda aparece por um instante, entre onde ela estava
+# na tela e o personagem (a câmera ainda alcançando). Visto em 15/11: 3 mira_perdida e 2 menus
+# sem o item (contados como falha, um com 3,2 s de procura) logo após pegar runa/moedas. Por esse
+# tempo (s), rótulos do mesmo item a até esse raio (px) do segmento pilha-personagem ficam de fora.
+COLETA_RECEM_PEGO = (1.2, 40)
 COLETA_SOB_PERSONAGEM = 90  # px do centro: depois de andar até a pilha, ela fica aqui
 # Onde procurar o item (texto de ação "Take") quando o clique caiu fora dele: primeiro uma
 # linha de rótulo abaixo, depois em volta
@@ -346,6 +351,14 @@ def refinar_mira(pos):
 
 def distancia(p1, p2):
     return float(np.linalg.norm(np.subtract(p1, p2)))
+
+
+def dist_segmento(p, a, b):
+    """Distância (px) do ponto p ao segmento a-b."""
+    ax, ay = a
+    dx, dy = b[0] - ax, b[1] - ay
+    t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / (dx * dx + dy * dy)))
+    return distancia(p, (ax + t * dx, ay + t * dy))
 
 
 # ========== Leituras com espera ==========
@@ -630,6 +643,8 @@ class ColetaChao:
         self.falhas = 0
         self.pausa_ate = 0.0
         self.ignoradas = []  # [(pos, até quando)] pilhas que falharam
+        self.recem_ate = 0.0  # até quando ignorar o rótulo "fantasma" da pilha recém-pega
+        self.recem_pos = CENTRO  # onde ela estava na tela quando foi pega
 
     def ativas(self):
         return self.ligado and time.time() >= self.pausa_ate
@@ -641,6 +656,9 @@ class ColetaChao:
         agora = time.time()
         self.ignoradas = [(p, t) for p, t in self.ignoradas if t > agora]
         itens = visao.detectar_itens_chao(img, self.item, origem=origem, ossos=ossos, mascara=mascara)
+        if agora < self.recem_ate:  # o rótulo da pilha recém-pega ainda aparece um instante
+            itens = [i for i in itens
+                     if dist_segmento(i["pos"], self.recem_pos, CENTRO) > COLETA_RECEM_PEGO[1]]
         return [i for i in itens if distancia(CENTRO, i["pos"]) <= raio
                 and not any(distancia(i["pos"], p) <= COLETA_IGNORAR_RAIO for p, _ in self.ignoradas)]
 
@@ -744,6 +762,8 @@ class ColetaChao:
         if ok:
             self.falhas = 0
             self.total += 1
+            self.recem_ate = time.time() + COLETA_RECEM_PEGO[0]
+            self.recem_pos = pos
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
             if dt < INVENTARIO_RAPIDA:  # diagnóstico: o que mudou no inventário tão rápido?
                 self._foto_inventario(inv_antes, leitura["inv"])
