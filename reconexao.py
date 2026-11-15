@@ -27,10 +27,10 @@ MAX_FOTOS = 30
 DIFERENCA_FOTO = 6.0  # média da diferença (0-255) na miniatura para considerar outra tela
 
 
-def carregar_moldes(pasta=PASTA_MOLDES):
+def carregar_moldes(pasta=None):
     """{nome: imagem cinza}. "_nome.png" = tela onde NÃO se clica (ex.: pedido de senha)."""
     moldes = {}
-    for caminho in sorted(glob.glob(os.path.join(pasta, "*.png"))):
+    for caminho in sorted(glob.glob(os.path.join(pasta or PASTA_MOLDES, "*.png"))):
         img = cv2.imread(caminho, cv2.IMREAD_GRAYSCALE)
         if img is not None:
             moldes[os.path.splitext(os.path.basename(caminho))[0]] = img
@@ -57,7 +57,12 @@ class Reconexao:
 
     def __init__(self, clicar_em, log, agora=time.time, moldes=None, pasta_fotos=PASTA_FOTOS):
         self.clicar_em, self.log, self.agora = clicar_em, log, agora
-        self.moldes = carregar_moldes() if moldes is None else moldes
+        # moldes=None: lê templates/login/ e relê quando a pasta muda (moldes novos entram sem
+        # reiniciar o bot, que perderia o estado da pausa por vida)
+        self.recarregar = moldes is None
+        self.assinatura = None
+        self.moldes = {} if moldes is None else moldes
+        self._recarregar()
         self.pasta_fotos = pasta_fotos
         self.fora_desde = None
         self.ultima_miniatura = None
@@ -73,6 +78,17 @@ class Reconexao:
             self.avisou.discard("fora")
         self.fora_desde = None
 
+    def _recarregar(self):
+        if not self.recarregar:
+            return
+        arquivos = sorted(glob.glob(os.path.join(PASTA_MOLDES, "*.png")))
+        assinatura = tuple((a, os.path.getmtime(a)) for a in arquivos)
+        if assinatura != self.assinatura:
+            self.assinatura = assinatura
+            self.moldes = carregar_moldes()
+            if arquivos:
+                self.log("moldes_login", nomes=sorted(self.moldes))
+
     def fora_do_jogo(self, img):
         """Chamar a cada quadro sem a interface no lugar (janela em foco e do tamanho certo).
         Devolve o que fez: None (ainda pode ser transição), "foto", "senha", "clique:<nome>",
@@ -82,6 +98,7 @@ class Reconexao:
             self.fora_desde = agora
         if agora - self.fora_desde < FORA_DO_JOGO_SEG or agora < self.proximo_passo:
             return None
+        self._recarregar()
         if "fora" not in self.avisou:
             self.avisou.add("fora")
             self.log("fora_do_jogo", seg=round(agora - self.fora_desde), moldes=len(self.moldes))
