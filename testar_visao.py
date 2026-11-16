@@ -905,8 +905,20 @@ def testar_semente():
         "e": ("limp", 949, 6), "g": ("big", 896, 7), "r": ("limp", 924, 4), "s": ("limp", 940, 7),
         "d": ("limp", 966, 7), "L": ("limp", 875, 6), "u": ("limp", 915, 7), "t": ("limp", 930, 4),
         "w": ("limp", 906, 7), "c": ("limp", 949, 5), "o": ("big", 918, 6), "i": ("limp", 883, 1),
-        "m": ("limp", 887, 9),
+        "m": ("limp", 887, 9), "R": ("big", 884, 6), "K": ("limp", 875, 6), "G": ("big", 884, 6),
+        "M": ("limp", 887, 9),
     }
+
+    # "anarr" real (de um "Grimy ranarr weed"), para montar "Ranarr seed": o caractere "#"
+    outro = cv2.imread(os.path.join(PASTA, "sementes", "ranarr_marrentill.png"))
+    anarr = None
+    if outro is not None:
+        b2 = visao.mascara_rotulos(outro)[0]
+        anarr = b2[650:650 + 18, 1185:1222]
+
+    # "Snape grass" real (16/11): o caractere "$"
+    real = cv2.imread(os.path.join(PASTA, "sementes", "snape_real.png"))
+    snape = None if real is None else visao.mascara_rotulos(real)[0][651:651 + 18, 848:934]
 
     def montar(texto, x0=700, y0=700, gap=2, espaco=7):
         out, x = img.copy(), x0
@@ -914,8 +926,13 @@ def testar_semente():
             if c == " ":
                 x += espaco - gap
                 continue
-            linha, gx, w = letras[c]
-            g = binm[tops[linha]:tops[linha] + 18, gx:gx + w]
+            if c == "#":
+                g, w = anarr, anarr.shape[1]
+            elif c == "$":
+                g, w = snape, snape.shape[1]
+            else:
+                linha, gx, w = letras[c]
+                g = binm[tops[linha]:tops[linha] + 18, gx:gx + w]
             out[y0:y0 + 18, x:x + w][g] = (255, 255, 255)
             x += w + gap
         fim = binm[tops["limp"]:tops["limp"] + 18, 979:1025]  # o "(18 gp)" real
@@ -925,7 +942,7 @@ def testar_semente():
     falhas = []
     if visao.detectar_itens_chao(img, "semente"):
         falhas.append("sementes: 'Limpwurt seed' real foi tomada por Snape grass seed")
-    casos = [("Snape grass seed", True), ("Limpwurt seed", False), ("Snape seed", False),
+    casos = [("$ seed", True), ("Snape grass seed", False), ("Limpwurt seed", False), ("Snape seed", False),
              ("grass seed", False), ("Swetcorn seed", False), ("Limpwurt grass seed", False),
              ("Snape Lass seed", False)]
     for gap in (2, 3):
@@ -933,20 +950,46 @@ def testar_semente():
             quadro, x_fim = montar(texto, gap=gap)
             achados = [i for i in visao.detectar_itens_chao(quadro, "semente") if abs(i["rotulo"][1] - 699) <= 4]
             if bool(achados) != esperado:
-                falhas.append(f"sementes: '{texto}' (folga {gap}) {'não foi pega' if esperado else 'foi pega'}")
+                falhas.append(f"sementes: '{texto.replace('$', 'Snape grass')}' (folga {gap}) "
+                              f"{'não foi pega' if esperado else 'foi pega'}")
             elif achados and abs(achados[0]["pos"][0] - ((700 + x_fim) // 2 - 3)) > 6:
                 falhas.append(f"sementes: '{texto}' (folga {gap}) com a pilha fora do centro: {achados[0]['pos']}")
+    # rótulo real (16/11): "Snape grass seed (8069 gp)" na pilha de um Big bones, com uma
+    # "Jangerberry seed" perto; só a Snape grass seed, no lugar onde o bot a pegou (942, 695)
+    if real is not None:
+        a = visao.detectar_itens_chao(real, "semente")
+        if len(a) != 1 or abs(a[0]["pos"][0] - 942) > 6 or abs(a[0]["pos"][1] - 695) > 6:
+            falhas.append(f"sementes/snape_real.png: esperava 1 Snape grass seed em (942, 695), achou {a}")
+        if visao.detectar_itens_chao(real, "semente_ranarr"):
+            falhas.append("sementes/snape_real.png: Snape grass seed tomada por Ranarr seed")
+    # Ranarr seed: "R" + o "anarr" real (folga entre letras 2-3 px, como a fonte do jogo; com 1 px nem o
+    # "seed" passa); as parecidas não passam, e uma semente não passa pela outra
+    n_ranarr = 0
+    if anarr is not None:
+        for gap in (2, 3):
+            for texto, item, esperado in (("R# seed", "semente_ranarr", True), ("r# seed", "semente_ranarr", False),
+                                          ("Kwuarm seed", "semente_ranarr", False), ("Guam seed", "semente_ranarr", False),
+                                          ("$ seed", "semente_ranarr", False), ("R# seed", "semente", False)):
+                quadro, x_fim = montar(texto, gap=gap)
+                achados = [i for i in visao.detectar_itens_chao(quadro, item) if abs(i["rotulo"][1] - 699) <= 4]
+                n_ranarr += 1
+                nome = texto.replace("#", "anarr")
+                if bool(achados) != esperado:
+                    falhas.append(f"sementes: '{nome}' como {item} (folga {gap}) {'não foi pega' if esperado else 'foi pega'}")
+                elif achados and abs(achados[0]["pos"][0] - ((700 + x_fim) // 2 - 3)) > 6:
+                    falhas.append(f"sementes: '{nome}' (folga {gap}) com a pilha fora do centro: {achados[0]['pos']}")
     # quadro real com "Grimy ranarr weed", "Marrentill seed" e "Belladonna seed": nem runa nem semente
-    outro = cv2.imread(os.path.join(PASTA, "sementes", "ranarr_marrentill.png"))
     if outro is not None:
-        for item in ("runa", "semente"):
+        for item in ("runa", "semente", "semente_ranarr"):
             if visao.detectar_itens_chao(outro, item):
                 falhas.append(f"sementes/ranarr_marrentill.png: achou '{item}' (ranarr/outras sementes)")
     # nenhuma semente nos quadros de runas e moedas
     outros = sorted(glob.glob(os.path.join(PASTA, "runas", "*.png")))
     for f in outros:
-        if visao.detectar_itens_chao(cv2.imread(f), "semente"):
-            falhas.append(f"sementes: achou Snape grass seed em runas/{os.path.basename(f)}")
+        quadro = cv2.imread(f)
+        for item in ("semente", "semente_ranarr"):
+            if visao.detectar_itens_chao(quadro, item):
+                falhas.append(f"sementes: achou '{item}' em runas/{os.path.basename(f)}")
     # menu: os de osso/runa/moedas com outro item na pilha têm 1 linha desconhecida; sem "Take", nenhuma
     menus = sorted(glob.glob(os.path.join(PASTA, "menus", "*.png")))
     com = 0
@@ -956,7 +999,7 @@ def testar_semente():
         com += p is not None
         if p is not None and not visao.menu_tem_take(rec):
             falhas.append(f"sementes: linha desconhecida num menu sem 'Take' (menus/{os.path.basename(f)})")
-    print(f"Snape grass seed: {2 * len(casos)} rótulos montados, {len(outros)} quadros sem semente, "
+    print(f"Sementes: {2 * len(casos)} rótulos Snape e {n_ranarr} Ranarr montados, {len(outros)} quadros sem semente, "
           f"{len(menus)} menus ({com} com 1 linha 'Take' desconhecida)")
     return falhas
 

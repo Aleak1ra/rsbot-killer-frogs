@@ -45,7 +45,7 @@ def _args():
                         "e a volta automática ao jogo (só se o orbe de vida não aparecer)")
     p.add_argument("--sem-runas", action="store_true", help="não pega as runas que caem no chão")
     p.add_argument("--sem-moedas", action="store_true", help="não pega as moedas (Coins) do chão")
-    p.add_argument("--sem-sementes", action="store_true", help="não pega as Snape grass seeds do chão")
+    p.add_argument("--sem-sementes", action="store_true", help="não pega as Snape grass seeds nem as Ranarr seeds do chão")
     p.add_argument("--amostras", action="store_true",
                    help="salva quadros em amostras/ para o testar_visao.py")
     a = p.parse_args()
@@ -348,7 +348,7 @@ ABA_INTERVALO = 5.0  # s entre cliques na aba da mochila (garantir_mochila)
 # Itens do chão pegos antes dos ossos: runas e moedas (--sem-runas / --sem-moedas desligam)
 PEGAR_RUNAS = not ARGS.sem_runas
 PEGAR_MOEDAS = not ARGS.sem_moedas
-PEGAR_SEMENTES = not ARGS.sem_sementes  # só "Snape grass seed" (as outras sementes ficam no chão)
+PEGAR_SEMENTES = not ARGS.sem_sementes  # só Snape grass seed e Ranarr seed (as outras ficam no chão)
 ESPERA_PEGAR_ITEM = 2.5  # + dist/150, como os ossos
 # Distância do loot (runas, moedas e ossos): o das próprias lutas cai perto (ossos: 95% a
 # <= 271 px; runas e moedas <= 122 px). O que está longe costuma ser de outros jogadores e
@@ -989,7 +989,7 @@ class ColetaChao:
             self.recem_pos = pos
             _ultima_coleta.update(t=time.time(), dist=dist)
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
-            if self.item == "semente":  # sem foto real do rótulo ainda: guarda para conferir o molde
+            if self.item.startswith("semente"):  # sem foto real do rótulo ainda: guarda para conferir
                 foto_diagnostico("semente_ok", img)
         else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
@@ -1002,11 +1002,12 @@ class ColetaChao:
 
 
 _fotos_falha = 0
-# Ordem de prioridade: Snape grass seed (rara), runas, moedas (os ossos vêm depois, no laço)
+# Ordem de prioridade: Ranarr seed e Snape grass seed (raras), runas, moedas (os ossos vêm depois, no laço)
 RUNAS = ColetaChao("runa", "runas", "🔮", PEGAR_RUNAS)
 MOEDAS = ColetaChao("moedas", "moedas", "🪙", PEGAR_MOEDAS)
 SEMENTES = ColetaChao("semente", "Snape grass seeds", "🌱", PEGAR_SEMENTES)
-COLETAS = (SEMENTES, RUNAS, MOEDAS)
+RANARR = ColetaChao("semente_ranarr", "Ranarr seeds", "🌿", PEGAR_SEMENTES)
+COLETAS = (RANARR, SEMENTES, RUNAS, MOEDAS)
 
 
 def atacar_sapo(img, sapos, t_quadro=None):

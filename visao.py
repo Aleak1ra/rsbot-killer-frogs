@@ -810,12 +810,19 @@ ITENS_CHAO = {
         "menu_limiar": 0.85, "menu_altura_x": None, "menu_colunas": None,
     },
     # "Snape grass seed [x N] (P gp)": a palavra "seed" (molde real, de um "Limpwurt seed") e
-    # antes dela as formas de "Snape" e "grass" (_snape_grass) — as outras sementes não
-    # passam. Sem molde de menu (nenhuma foto do menu dela ainda): achar_take_item_no_menu
-    # pega a única linha "Take" que não é osso, runa nem moedas.
+    # antes dela "Snape grass" (molde real, _snape_grass) — as outras sementes não passam.
+    # Sem molde de menu (nenhuma foto do menu dela ainda): achar_take_item_no_menu pega a
+    # única linha "Take" que não é osso, runa nem moedas.
     "semente": {
         "rotulo": cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
         "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "snape_grass",
+        "menu": None,
+    },
+    # "Ranarr seed [x N] (P gp)": o mesmo "seed" e, antes dele, uma palavra que começa com
+    # maiúscula e termina com o "anarr" real de um "Grimy ranarr weed" (_ranarr).
+    "semente_ranarr": {
+        "rotulo": cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
+        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "ranarr",
         "menu": None,
     },
 }
@@ -834,7 +841,7 @@ ROTULO_ESPACO_MAX = 10
 # Estrutura do rótulo em volta da palavra casada: quantas palavras antes dela e quantas
 # depois, com e sem o "x N" de quantidade. Runa: "<Nome> rune [x N] (P gp)"; moedas:
 # "Coins [x N]".
-ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0), "semente": (2, 4, 2)}
+ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0), "semente": (2, 4, 2), "semente_ranarr": (1, 4, 2)}
 DENTRO_MARGEM = 6  # px da borda da área do jogo: clique mais perto que isso é recusado
 
 
@@ -921,17 +928,18 @@ def _centro_rotulo(binm, topo, x_meio, item, limites):
 # em +11 e as pernas (g, p) descem até +16.
 ROTULO_ALTAS = (0, 4)  # linhas só com tinta de maiúsculas e letras altas (l, t, d...)
 ROTULO_PERNAS = (13, 17)  # linhas só com tinta de pernas
-SNAPE_LARGURA = (32, 47)  # px da palavra "Snape" (estimado pelas letras: ~39)
-GRASS_LARGURA = (35, 46)  # px da palavra "grass" (estimado: ~40)
+# "Snape grass" de um rótulo real (16/11, "Snape grass seed (8069 gp)"): 19 linhas a partir de 2
+# acima do topo das maiúsculas. Palavras medidas: "Snape" 41 px, "grass" 39 px.
+SNAPE_GRASS = _carregar("snape_grass_label_osrs.png", cinza=True)
+SNAPE_LARGURA = (38, 44)
+GRASS_LARGURA = (36, 42)
+SNAPE_GRASS_NOTA = 0.8  # nota de "Snape grass" antes do "seed" (o próprio molde dá 1,0)
 
 
 def _snape_grass(binm, topo, x_meio):
-    """As duas palavras antes do "seed" em x_meio têm a forma de "Snape grass"?
-
-    Não há foto do rótulo (a semente é rara), então confere a forma, medida nas letras de
-    outros rótulos da mesma fonte: "grass" não tem letra alta, começa com perna (g) e não
-    tem outra; "Snape" começa com maiúscula, não tem outra letra alta e tem perna (p) no
-    meio. "Limpwurt seed" (uma palavra só, com L, t alto) e as demais sementes não passam."""
+    """As duas palavras antes do "seed" em x_meio são "Snape grass"? Largura de cada uma (medida
+    no rótulo real) e o desenho das duas contra o molde real. "Limpwurt seed", "Jangerberry seed"
+    e as outras sementes não passam."""
     faixa = binm[topo:topo + 13].any(axis=0)
     ws = _palavras(faixa, max(x_meio - 320, 0), min(x_meio + 30, len(faixa)))
     k = next((i for i, (a, b) in enumerate(ws) if a <= x_meio <= b), None)
@@ -943,12 +951,11 @@ def _snape_grass(binm, topo, x_meio):
     if not (GRASS_LARGURA[0] <= g2 - g1 + 1 <= GRASS_LARGURA[1]
             and SNAPE_LARGURA[0] <= s2 - s1 + 1 <= SNAPE_LARGURA[1]):
         return False
-    altas = binm[topo + ROTULO_ALTAS[0]:topo + ROTULO_ALTAS[1]].any(axis=0)
-    pernas = binm[topo + ROTULO_PERNAS[0]:topo + ROTULO_PERNAS[1]].any(axis=0)
-    grass = (not altas[g1:g2 + 1].any() and pernas[g1:g1 + 8].any() and not pernas[g1 + 9:g2 + 1].any())
-    snape = (altas[s1:s1 + 8].any() and not altas[s1 + 9:s2 + 1].any()
-             and pernas[s1 + 12:s2 - 6].any() and not pernas[s1:s1 + 10].any())
-    return bool(grass and snape)
+    th, tw = SNAPE_GRASS.shape
+    reg = binm[max(topo - 4, 0):topo - 2 + th + 2, max(s1 - 3, 0):s1 - 1 + tw + 3].astype(np.uint8) * 255
+    if reg.shape[0] < th or reg.shape[1] < tw:
+        return False
+    return float(cv2.matchTemplate(reg, SNAPE_GRASS, cv2.TM_CCOEFF_NORMED).max()) >= SNAPE_GRASS_NOTA
 
 
 RUNE_LARGURA = (27, 34)  # px da palavra "rune" no rótulo (medido em 62 rótulos: 30-31)
@@ -963,7 +970,38 @@ def _largura_rune(binm, topo, x_meio):
     return w is not None and RUNE_LARGURA[0] <= w <= RUNE_LARGURA[1]
 
 
-CONFERIR_ROTULO = {"snape_grass": _snape_grass, "largura_rune": _largura_rune}
+# "anarr" de "ranarr", cortado de um rótulo real ("Grimy ranarr weed", 16/11): 19 linhas a partir
+# de 2 acima do topo das maiúsculas. "Ranarr" = R maiúsculo + 1-3 px + isso.
+ANARR = _carregar("anarr_label_osrs.png", cinza=True)
+RANARR_LARGURA = (ANARR.shape[1] + 6, ANARR.shape[1] + 12)  # o "R" tem ~6 px (estimado pelo "B")
+RANARR_NOTA = 0.8  # nota do "anarr" no fim da palavra (o próprio molde dá 1,0)
+
+
+def _ranarr(binm, topo, x_meio):
+    """A palavra antes do "seed" em x_meio é "Ranarr"? Começa com maiúscula (letra alta só no
+    começo) e termina com o "anarr" real. "Kwuarm", "Guam" e as outras sementes
+    de uma palavra não passam (o fim não é "anarr", ou a largura não bate)."""
+    faixa = binm[topo:topo + 13].any(axis=0)
+    ws = _palavras(faixa, max(x_meio - 200, 0), min(x_meio + 30, len(faixa)))
+    k = next((i for i, (a, b) in enumerate(ws) if a <= x_meio <= b), None)
+    if k is None or k < 1:
+        return False
+    g1, g2 = ws[k - 1]
+    if ws[k][0] - g2 > ROTULO_ESPACO_MAX or not RANARR_LARGURA[0] <= g2 - g1 + 1 <= RANARR_LARGURA[1]:
+        return False
+    # (sem filtro de pernas: o "a" e o "r" reais têm um pixel na linha +13, onde ele começa)
+    altas = binm[topo + ROTULO_ALTAS[0]:topo + ROTULO_ALTAS[1]].any(axis=0)
+    if not altas[g1:g1 + 8].any() or altas[g1 + 9:g2 + 1].any():
+        return False
+    th, tw = ANARR.shape
+    y1, x1 = topo - 2 - 2, g2 + 1 - tw - 2  # 2 px de folga em volta, para cada lado
+    reg = binm[max(y1, 0):topo - 2 + th + 2, max(x1, 0):g2 + 1 + 2].astype(np.uint8) * 255
+    if reg.shape[0] < th or reg.shape[1] < tw:
+        return False
+    return float(cv2.matchTemplate(reg, ANARR, cv2.TM_CCOEFF_NORMED).max()) >= RANARR_NOTA
+
+
+CONFERIR_ROTULO = {"snape_grass": _snape_grass, "largura_rune": _largura_rune, "ranarr": _ranarr}
 
 
 def so_altura_x(binm, x, y, altura_x, colunas, folga=1, k=5):

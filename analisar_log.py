@@ -161,11 +161,11 @@ def resumir(eventos):
                   f"latência (s): {pct([e['lat'] for e in g if e['ok']])}")
 
     # Runas e moedas (main.ColetaChao): falha sem 'motivo' = o inventário não mudou
-    coletas = {item: por.get(f"pegar_{item}", []) for item in ("runa", "moedas", "semente")}
+    coletas = {item: por.get(f"pegar_{item}", []) for item in ("runa", "moedas", "semente", "semente_ranarr")}
     extras = {nome: por.get(nome, []) for nome in ("mira_perdida", "menu_procura", "clique_cancelado")}
     if any(coletas.values()) or any(extras.values()):
         print("\nItens do chão:")
-        for item, plural in (("runa", "runas"), ("moedas", "moedas"), ("semente", "Snape grass seeds")):
+        for item, plural in (("runa", "runas"), ("moedas", "moedas"), ("semente", "Snape grass seeds"), ("semente_ranarr", "Ranarr seeds")):
             g = coletas[item]
             if not g:
                 continue
