@@ -539,6 +539,12 @@ def painel(img_painel):
     return vermelho, verde
 
 
+# Pixels verdes na barra do oponente para ele ainda ter vida. Era 50: um Moss giant com 1/60 de
+# vida (40 px verdes, visto em 16/11) contava como morto, o ataque nele dava "não começou" e o bot
+# ia atrás de outro. Painel de monstro morto: 0 verde em todos os 180 quadros salvos.
+PAINEL_VERDE_MIN = 8
+
+
 def estado_combate(img):
     """'livre' (sem painel), 'lutando' (oponente com vida) ou 'morto' (barra zerada).
 
@@ -548,7 +554,7 @@ def estado_combate(img):
     vermelho, verde = painel(recortar(img, PAINEL_OPONENTE))
     if vermelho + verde <= 1500:
         return "livre"
-    return "lutando" if verde > 50 else "morto"
+    return "lutando" if verde > PAINEL_VERDE_MIN else "morto"
 
 
 # ---------- Monstros ----------
@@ -793,7 +799,7 @@ def detectar_ossos_chao(img, origem=(0, 0), mascara=None):
 ITENS_CHAO = {
     "runa": {
         "rotulo": cv2.GaussianBlur(_carregar("rune_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
-        "limiar": 0.85, "altura_x": (6, 13), "colunas": (3, 31),
+        "limiar": 0.85, "altura_x": (6, 13), "colunas": (3, 31), "conferir": "largura_rune",
         "menu": _carregar("menu_rune_word_osrs.png", cinza=True),
         "menu_limiar": 0.85, "menu_altura_x": (7, 13), "menu_colunas": (3, 36),
     },
@@ -802,6 +808,15 @@ ITENS_CHAO = {
         "limiar": 0.84, "altura_x": None, "colunas": None,
         "menu": _carregar("menu_coins_word_osrs.png", cinza=True),
         "menu_limiar": 0.85, "menu_altura_x": None, "menu_colunas": None,
+    },
+    # "Snape grass seed [x N] (P gp)": a palavra "seed" (molde real, de um "Limpwurt seed") e
+    # antes dela as formas de "Snape" e "grass" (_snape_grass) — as outras sementes não
+    # passam. Sem molde de menu (nenhuma foto do menu dela ainda): achar_take_item_no_menu
+    # pega a única linha "Take" que não é osso, runa nem moedas.
+    "semente": {
+        "rotulo": cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
+        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "snape_grass",
+        "menu": None,
     },
 }
 ROTULO_ENTRE_LINHAS = 22  # px entre rótulos empilhados sobre a mesma pilha
@@ -819,7 +834,7 @@ ROTULO_ESPACO_MAX = 10
 # Estrutura do rótulo em volta da palavra casada: quantas palavras antes dela e quantas
 # depois, com e sem o "x N" de quantidade. Runa: "<Nome> rune [x N] (P gp)"; moedas:
 # "Coins [x N]".
-ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0)}
+ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0), "semente": (2, 4, 2)}
 DENTRO_MARGEM = 6  # px da borda da área do jogo: clique mais perto que isso é recusado
 
 
@@ -902,6 +917,55 @@ def _centro_rotulo(binm, topo, x_meio, item, limites):
     return (esq + dir_) // 2
 
 
+# Linha do rótulo a partir do topo das maiúsculas: minúsculas começam 5 px abaixo, a base fica
+# em +11 e as pernas (g, p) descem até +16.
+ROTULO_ALTAS = (0, 4)  # linhas só com tinta de maiúsculas e letras altas (l, t, d...)
+ROTULO_PERNAS = (13, 17)  # linhas só com tinta de pernas
+SNAPE_LARGURA = (32, 47)  # px da palavra "Snape" (estimado pelas letras: ~39)
+GRASS_LARGURA = (35, 46)  # px da palavra "grass" (estimado: ~40)
+
+
+def _snape_grass(binm, topo, x_meio):
+    """As duas palavras antes do "seed" em x_meio têm a forma de "Snape grass"?
+
+    Não há foto do rótulo (a semente é rara), então confere a forma, medida nas letras de
+    outros rótulos da mesma fonte: "grass" não tem letra alta, começa com perna (g) e não
+    tem outra; "Snape" começa com maiúscula, não tem outra letra alta e tem perna (p) no
+    meio. "Limpwurt seed" (uma palavra só, com L, t alto) e as demais sementes não passam."""
+    faixa = binm[topo:topo + 13].any(axis=0)
+    ws = _palavras(faixa, max(x_meio - 320, 0), min(x_meio + 30, len(faixa)))
+    k = next((i for i, (a, b) in enumerate(ws) if a <= x_meio <= b), None)
+    if k is None or k < 2:
+        return False
+    (s1, s2), (g1, g2) = ws[k - 2], ws[k - 1]
+    if ws[k][0] - g2 > ROTULO_ESPACO_MAX or g1 - s2 > ROTULO_ESPACO_MAX:
+        return False
+    if not (GRASS_LARGURA[0] <= g2 - g1 + 1 <= GRASS_LARGURA[1]
+            and SNAPE_LARGURA[0] <= s2 - s1 + 1 <= SNAPE_LARGURA[1]):
+        return False
+    altas = binm[topo + ROTULO_ALTAS[0]:topo + ROTULO_ALTAS[1]].any(axis=0)
+    pernas = binm[topo + ROTULO_PERNAS[0]:topo + ROTULO_PERNAS[1]].any(axis=0)
+    grass = (not altas[g1:g2 + 1].any() and pernas[g1:g1 + 8].any() and not pernas[g1 + 9:g2 + 1].any())
+    snape = (altas[s1:s1 + 8].any() and not altas[s1 + 9:s2 + 1].any()
+             and pernas[s1 + 12:s2 - 6].any() and not pernas[s1:s1 + 10].any())
+    return bool(grass and snape)
+
+
+RUNE_LARGURA = (27, 34)  # px da palavra "rune" no rótulo (medido em 62 rótulos: 30-31)
+
+
+def _largura_rune(binm, topo, x_meio):
+    """A palavra casada tem a largura de "rune"? Visto em jogo (16/11): "ranarr", de "Grimy
+    ranarr weed" (43 px), dava 0,865 no molde de "rune" e a erva era pega como runa."""
+    faixa = binm[topo:topo + 13].any(axis=0)
+    ws = _palavras(faixa, max(x_meio - 60, 0), min(x_meio + 60, len(faixa)))
+    w = next((b - a + 1 for a, b in ws if a <= x_meio <= b), None)
+    return w is not None and RUNE_LARGURA[0] <= w <= RUNE_LARGURA[1]
+
+
+CONFERIR_ROTULO = {"snape_grass": _snape_grass, "largura_rune": _largura_rune}
+
+
 def so_altura_x(binm, x, y, altura_x, colunas, folga=1, k=5):
     """A palavra casada em (x, y) não tem tinta acima da altura-x nem abaixo da base?
 
@@ -979,6 +1043,8 @@ def detectar_itens_chao(img, item, origem=(0, 0), ossos=None, mascara=None):
             continue
         topo = y + 1  # topo das maiúsculas da linha do rótulo
         x_meio = x + cfg["rotulo"].shape[1] // 2
+        if cfg.get("conferir") and not CONFERIR_ROTULO[cfg["conferir"]](binm, topo, x_meio):
+            continue
         centro = _centro_rotulo(binm, topo, x_meio, item, limites)
         if centro is None:
             continue  # incerto: melhor não clicar do que clicar em outra pilha
@@ -1022,6 +1088,8 @@ def achar_take_item_no_menu(img_regiao, item):
     apareceu (~0,6 = menu sem "Take", por exemplo clique num ponto sem itens).
     """
     cfg = ITENS_CHAO[item]
+    if cfg["menu"] is None:
+        return achar_take_desconhecido_no_menu(img_regiao)
     mt = mascara_texto(img_regiao)
     binm = mt > 100
     th, tw = MENU_TAKE_PALAVRA.shape
@@ -1048,6 +1116,38 @@ def achar_take_item_no_menu(img_regiao, item):
             return None, nota_item
         return None, float(rt.max()) if rt.size else 0.0
     return melhor, melhor_score
+
+
+def achar_take_desconhecido_no_menu(img_regiao):
+    """A única linha "Take <item>" do menu que não é Big bones, runa nem moedas (para um item
+    sem molde de menu, cuja pilha o rótulo do chão já identificou). Devolve ((x, y) do "Take",
+    1.0), ou (None, nota): 0.0 se há mais de uma linha desconhecida (não adivinha) ou nenhuma;
+    a nota do "Take" se o menu não tem "Take"."""
+    mt = mascara_texto(img_regiao)
+    th, tw = MENU_TAKE_PALAVRA.shape
+    rt = cv2.matchTemplate(mt, MENU_TAKE_PALAVRA, cv2.TM_CCOEFF_NORMED)
+    linhas = picos(rt, MENU_TAKE_THRESHOLD, 30, 8, limite=12)
+    if not linhas:
+        return None, float(rt.max()) if rt.size else 0.0
+    # (molde, limiar, faixa em volta do "Take" em (x, y)): o molde do osso é a linha inteira
+    # "Take Big bones" (mais alto que a palavra "Take"); os outros, só a palavra do item
+    conhecidos = [(MENU_TAKE, MENU_THRESHOLD_COM_TAKE,
+                   lambda x, y: mt[max(y - 6, 0):y + MENU_TAKE.shape[0] + 6, max(x - 8, 0):x + MENU_TAKE.shape[1] + 8])]
+    conhecidos += [(c["menu"], c["menu_limiar"], lambda x, y: mt[max(y - 3, 0):y + th + 3, x + tw:x + tw + 300])
+                   for c in ITENS_CHAO.values() if c["menu"] is not None]
+    outras = []
+    for x, y, _ in linhas:
+        conhecida = False
+        for tpl, limiar, recorte in conhecidos:
+            faixa = recorte(x, y)
+            if faixa.shape[0] >= tpl.shape[0] and faixa.shape[1] >= tpl.shape[1] and                     float(cv2.matchTemplate(faixa, tpl, cv2.TM_CCOEFF_NORMED).max()) >= limiar:
+                conhecida = True
+                break
+        if not conhecida:
+            outras.append((x + tw // 2, y + th // 2))
+    if len(outras) == 1:
+        return outras[0], 1.0
+    return None, 0.0
 
 
 def menu_tem_take(img_regiao):
@@ -1155,6 +1255,23 @@ def slots_ocupados(img_inventario):
             if float(cv2.absdiff(a, b).mean()) > SLOT_DIFERENCA_MIN:
                 n += 1
     return n
+
+
+SLOT_ITEM_MIN_PX = 20  # pixels diferentes do slot vazio (vazio: 0; o menor item visto, uma semente: 75)
+
+
+def inventario_cheio(img_inventario):
+    """Os 28 slots têm item? Mais sensível que slots_ocupados (que perdia o ícone pequeno de
+    uma semente): no slot vazio a diferença para a foto do inventário vazio é zero."""
+    for linha in range(7):
+        for coluna in range(4):
+            x = int(SLOT_ORIGEM[0] + coluna * SLOT_PASSO[0])
+            y = int(SLOT_ORIGEM[1] + linha * SLOT_PASSO[1])
+            a = img_inventario[y - SLOT_MEIA[1]:y + SLOT_MEIA[1], x - SLOT_MEIA[0]:x + SLOT_MEIA[0]]
+            b = INVENTARIO_VAZIO[y - SLOT_MEIA[1]:y + SLOT_MEIA[1], x - SLOT_MEIA[0]:x + SLOT_MEIA[0]]
+            if int((cv2.absdiff(a, b).max(axis=2) > 40).sum()) < SLOT_ITEM_MIN_PX:
+                return False
+    return True
 
 
 # ---------- Árvores ----------

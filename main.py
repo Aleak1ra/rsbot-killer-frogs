@@ -45,6 +45,7 @@ def _args():
                         "e a volta automática ao jogo (só se o orbe de vida não aparecer)")
     p.add_argument("--sem-runas", action="store_true", help="não pega as runas que caem no chão")
     p.add_argument("--sem-moedas", action="store_true", help="não pega as moedas (Coins) do chão")
+    p.add_argument("--sem-sementes", action="store_true", help="não pega as Snape grass seeds do chão")
     p.add_argument("--amostras", action="store_true",
                    help="salva quadros em amostras/ para o testar_visao.py")
     a = p.parse_args()
@@ -309,6 +310,7 @@ MIRA_DESLOC_MAX = 60
 # Sapo com barra de vida sobre a cabeça já está lutando com outro jogador.
 # Medido: 8 de 9 ataques que falharam tinham >= 36 px de barra; os 47 que deram certo, 0.
 BARRA_SAPO_OCUPADO = 25
+MAX_COLETAS_SEGUIDAS = 2  # coletas do chão entre dois ataques, havendo monstro livre à vista
 
 # Menu de botão direito (pilhas de itens): meia largura/altura da área lida em volta do clique
 MENU_RAIO = (280, 330)
@@ -326,6 +328,9 @@ SEM_VIDA = ARGS.sem_vida
 
 # Combate
 ESPERA_INICIO_COMBATE = 5.0  # medido em 120 ataques: 1,5 s típico, 4,25 s no pior caso
+# Alvo perto começa a luta mais cedo: espera 3,0 s + dist/150 (medido em 4905 ataques: a até
+# 150 px o pior caso foi 3,28 s; de 150 a 300 px, 4,94 s). Um ataque que não pega custa menos.
+ESPERA_COMBATE_PERTO = 3.0
 # Recorte do canto com o painel do oponente: a espera do combate lê só ele (~10x mais rápido que
 # a janela inteira); começa em (0, 0), então as posições de visao.PAINEL_OPONENTE valem nele
 PAINEL = (0, 0, visao.PAINEL_OPONENTE[2], visao.PAINEL_OPONENTE[3])
@@ -343,6 +348,7 @@ ABA_INTERVALO = 5.0  # s entre cliques na aba da mochila (garantir_mochila)
 # Itens do chão pegos antes dos ossos: runas e moedas (--sem-runas / --sem-moedas desligam)
 PEGAR_RUNAS = not ARGS.sem_runas
 PEGAR_MOEDAS = not ARGS.sem_moedas
+PEGAR_SEMENTES = not ARGS.sem_sementes  # só "Snape grass seed" (as outras sementes ficam no chão)
 ESPERA_PEGAR_ITEM = 2.5  # + dist/150, como os ossos
 # Distância do loot (runas, moedas e ossos): o das próprias lutas cai perto (ossos: 95% a
 # <= 271 px; runas e moedas <= 122 px). O que está longe costuma ser de outros jogadores e
@@ -983,6 +989,8 @@ class ColetaChao:
             self.recem_pos = pos
             _ultima_coleta.update(t=time.time(), dist=dist)
             print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
+            if self.item == "semente":  # sem foto real do rótulo ainda: guarda para conferir o molde
+                foto_diagnostico("semente_ok", img)
         else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
             depois = capturar()
@@ -994,10 +1002,11 @@ class ColetaChao:
 
 
 _fotos_falha = 0
-# Ordem de prioridade: runas, depois moedas (os ossos vêm depois, no laço)
+# Ordem de prioridade: Snape grass seed (rara), runas, moedas (os ossos vêm depois, no laço)
 RUNAS = ColetaChao("runa", "runas", "🔮", PEGAR_RUNAS)
 MOEDAS = ColetaChao("moedas", "moedas", "🪙", PEGAR_MOEDAS)
-COLETAS = (RUNAS, MOEDAS)
+SEMENTES = ColetaChao("semente", "Snape grass seeds", "🌱", PEGAR_SEMENTES)
+COLETAS = (SEMENTES, RUNAS, MOEDAS)
 
 
 def atacar_sapo(img, sapos, t_quadro=None):
@@ -1040,9 +1049,11 @@ def atacar_sapo(img, sapos, t_quadro=None):
                    desloc=desloc)
             return False
         ok, dt = esperar(lambda: visao.estado_combate(capturar(PAINEL)) == "lutando",
-                         ESPERA_INICIO_COMBATE, 0.1)
+                         min(ESPERA_INICIO_COMBATE, ESPERA_COMBATE_PERTO + dist / 150), 0.1)
         LOG.ev("atacar", ok=ok, lat=round(dt, 3), dist=round(dist), barra=barra, clique=clique,
                desloc=desloc)
+        if not ok:  # por que a luta não começou? (o chat costuma dizer: "Someone else is fighting that")
+            foto_diagnostico("ataque_falhou", capturar())
         if not ok and SALVAR_AMOSTRAS:  # sem a flag, a captura do 'depois' seria à toa
             salvar_amostra("ataque_falhou_antes", img, pos, barra=barra)
             salvar_amostra("ataque_falhou_depois", capturar(), pos, barra=barra)
@@ -1105,6 +1116,31 @@ def esperar_loot(inicio, osso=True):
 
 
 # ========== Loops ==========
+TELA_PARADA_PX = 1.0  # deslocamento entre dois quadros abaixo disso = câmera parada
+TELA_PARADA_TIMEOUT = 1.5
+TELA_PARADA_AREA = (560, 250, 1380, 900)  # miolo da área do jogo, sem a interface
+
+
+def esperar_tela_parar():
+    """Espera a câmera parar de deslizar (o personagem parar de andar): dois quadros seguidos do
+    miolo do jogo com deslocamento < TELA_PARADA_PX (correlação de fase, reduzido 4x; monstros
+    se mexendo não deslocam o quadro inteiro). Devolve {'ok', 'seg'} para o log."""
+    def quadro():
+        g = cv2.cvtColor(capturar(TELA_PARADA_AREA), cv2.COLOR_BGR2GRAY)
+        return np.float32(cv2.resize(g, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA))
+
+    inicio = time.perf_counter()
+    anterior = quadro()
+    while time.perf_counter() - inicio < TELA_PARADA_TIMEOUT:
+        time.sleep(0.06)
+        atual = quadro()
+        (dx, dy), _ = cv2.phaseCorrelate(anterior, atual)
+        if 4 * float(np.hypot(dx, dy)) < TELA_PARADA_PX:
+            return {"ok": True, "seg": round(time.perf_counter() - inicio, 2)}
+        anterior = atual
+    return {"ok": False, "seg": round(time.perf_counter() - inicio, 2)}
+
+
 def coletar_chao(img, raio, coletar):
     """Uma coleta do chão em volta do personagem: runas e moedas primeiro (valem mais e caem
     na mesma pilha), depois ossos (se `coletar`). Devolve (agiu, t): agiu = "osso", True (outro
@@ -1123,9 +1159,42 @@ def coletar_chao(img, raio, coletar):
         if itens and coleta.pegar(img, itens):
             return True, time.perf_counter()
     t = time.perf_counter()
-    if coletar and ossos and pegar_osso(img, ossos):
-        return "osso", t
+    if coletar and ossos:
+        if mochila_cheia(img):
+            # sem espaço o osso do chão não entra: enterra um da mochila para abrir um espaço
+            inventario = visao.detectar_ossos_inventario(visao.recortar(img, visao.INVENTARIO))
+            if inventario and ENTERRO.pode():
+                ENTERRO.um(inventario, "cheia")
+                return "enterrou", t
+            if inventario:
+                time.sleep(0.1)  # o enterro anterior ainda não terminou
+                return "enterrou", t
+            avisar_mochila_cheia()
+        elif pegar_osso(img, ossos):
+            return "osso", t
     return False, t
+
+
+MOCHILA_AVISO_SEG = 300  # s entre avisos de mochila cheia sem osso para enterrar
+_cheia = {"aviso": 0.0}
+
+
+def mochila_cheia(img):
+    """Mochila com os 28 espaços ocupados? Com ela cheia o osso do chão não entra ("You don't
+    have enough inventory space") e o bot ficava tentando pegar, travado."""
+    return visao.inventario_cheio(visao.recortar(img, visao.INVENTARIO))
+
+
+def avisar_mochila_cheia():
+    """Cheia e sem osso para enterrar: os ossos ficam no chão. Avisa (com bipe) no máximo a cada
+    MOCHILA_AVISO_SEG; com osso na mochila o bot resolve sozinho e não incomoda."""
+    if time.time() - _cheia["aviso"] < MOCHILA_AVISO_SEG:
+        return
+    _cheia["aviso"] = time.time()
+    LOG.ev("mochila_cheia")
+    tela.bip("erro")
+    print("\n🎒 Mochila cheia e sem osso para enterrar: deixo os ossos no chão até abrir espaço "
+          "(guarde ou largue itens). Sigo atacando e pegando o que empilha.")
 
 
 def aproveitar_pausa(img):
@@ -1157,6 +1226,7 @@ def loop_principal():
     em_luta = False
     inicio_luta = 0.0
     livre_desde = None  # em luta, o painel do oponente sumiu desde então (COMBATE_LIVRE_SEG)
+    coletas_seguidas = 0  # coletas do chão desde a última tentativa de ataque
     em_foco = True
     avisou_inativo = False
     vigia_vida = VIGIA_VIDA  # do módulo: um recomeço do laço (erro) não esquece a pausa
@@ -1378,18 +1448,35 @@ def loop_principal():
         t3 = t4 = time.perf_counter()
         raio = COLETA_RAIO_PERTO if sapos else COLETA_RAIO_MAX
 
-        # Loot do chão: runas e moedas primeiro (valem mais e caem na mesma pilha), depois ossos
-        agiu, t4 = coletar_chao(img, raio, coletar)
+        # Loot do chão: runas e moedas primeiro (valem mais e caem na mesma pilha), depois ossos.
+        # Com monstro livre à vista, no máximo MAX_COLETAS_SEGUIDAS coletas entre um ataque e
+        # outro: com muito loot no chão o bot ficava só catando (visto: 1 ataque/min em vez de 3;
+        # 152 de 302 s entre lutas eram coleta). O que sobra é pego depois da próxima luta.
+        livre = coletas_seguidas >= MAX_COLETAS_SEGUIDAS and any(
+            visao.barra_vida_perto(img, s["pos"], *PERFIL["barra"]) < BARRA_SAPO_OCUPADO for s in sapos)
+        if livre:
+            agiu = False
+        else:
+            agiu, t4 = coletar_chao(img, raio, coletar)
         if agiu == "osso":
             ossos_pegos += 1
             print(f"🦴 Ossos coletados do chão: {ossos_pegos}")
         if agiu:
+            if agiu != "enterrou":  # enterrar para abrir espaço não conta como coleta
+                coletas_seguidas += 1
             continue
 
         # A espera da mira (~1 s, tela andando) ou uma coleta que falhou pelo menu (~3,9 s) deixou
         # o quadro velho: ataca por um quadro novo, conferido como o do começo do ciclo (visto: 2
         # hovers falhos com quadro de 1,0-1,3 s). A mira perdida conta mesmo com o quadro novo.
-        if _mira["perdida"] or time.perf_counter() - t0 > QUADRO_VELHO_SEG:
+        # Logo depois de uma coleta longe o personagem ainda anda e a câmera desliza: o clique de
+        # ataque caía no chão ou em outro monstro (visto: 2 falhas em 5 ataques assim que o limite
+        # de coletas pôs o ataque logo depois da coleta). Espera a tela parar.
+        andando = (time.time() - _ultima_coleta["t"] < MIRA_LONGA[0]
+                   and _ultima_coleta["dist"] > MIRA_LONGA[1])
+        if andando:
+            LOG.ev("tela_parou", **esperar_tela_parar())
+        if andando or _mira["perdida"] or time.perf_counter() - t0 > QUADRO_VELHO_SEG:
             _mira["perdida"] = False
             t0 = time.perf_counter()
             img = capturar()
@@ -1403,6 +1490,7 @@ def loop_principal():
         # Atacar o sapo mais próximo
         LOG.ev("ciclo", captura=round(t1 - t0, 4), rotulos=round(t4 - t3, 4),
                sapos=round(t3 - t2, 4), n_sapos=len(sapos))
+        coletas_seguidas = 0  # vai tentar atacar (ou não há monstro): o limite recomeça
         if sapos and atacar_sapo(img, sapos, t0):
             for coleta in COLETAS:
                 coleta.ignoradas.clear()  # o personagem vai andar: as posições de tela mudam

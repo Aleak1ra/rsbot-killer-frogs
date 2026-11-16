@@ -888,12 +888,86 @@ def testar_mochila_aberta():
     return falhas
 
 
+def testar_semente():
+    """Snape grass seed (item "semente"): não há foto do rótulo dela, então o teste monta
+    rótulos com letras reais do quadro amostras/sementes/limpwurt_seed.png. Só "Snape grass
+    seed" pode ser pega; as outras sementes, não. No menu, só a linha "Take" desconhecida."""
+    caminho = os.path.join(PASTA, "sementes", "limpwurt_seed.png")
+    img = cv2.imread(caminho)
+    if img is None:
+        print("Snape grass seed: sem dados (amostras/sementes/limpwurt_seed.png)")
+        return []
+    binm = visao.mascara_rotulos(img)[0]
+    topo = lambda y1, y2, x1, x2: y1 + int(np.flatnonzero(binm[y1:y2, x1:x2].any(axis=1)).min())  # noqa: E731
+    tops = {"limp": topo(494, 514, 870, 1000), "big": topo(516, 534, 878, 955), "earth": topo(560, 578, 1008, 1090)}
+    letras = {  # letra: (linha de origem, x, largura); "S" = o "B" de "Big" (só a forma conta)
+        "S": ("big", 884, 6), "n": ("big", 927, 6), "a": ("earth", 1021, 7), "p": ("limp", 898, 6),
+        "e": ("limp", 949, 6), "g": ("big", 896, 7), "r": ("limp", 924, 4), "s": ("limp", 940, 7),
+        "d": ("limp", 966, 7), "L": ("limp", 875, 6), "u": ("limp", 915, 7), "t": ("limp", 930, 4),
+        "w": ("limp", 906, 7), "c": ("limp", 949, 5), "o": ("big", 918, 6), "i": ("limp", 883, 1),
+        "m": ("limp", 887, 9),
+    }
+
+    def montar(texto, x0=700, y0=700, gap=2, espaco=7):
+        out, x = img.copy(), x0
+        for c in texto + " ":
+            if c == " ":
+                x += espaco - gap
+                continue
+            linha, gx, w = letras[c]
+            g = binm[tops[linha]:tops[linha] + 18, gx:gx + w]
+            out[y0:y0 + 18, x:x + w][g] = (255, 255, 255)
+            x += w + gap
+        fim = binm[tops["limp"]:tops["limp"] + 18, 979:1025]  # o "(18 gp)" real
+        out[y0:y0 + 18, x:x + fim.shape[1]][fim] = (255, 255, 255)
+        return out, x + fim.shape[1]
+
+    falhas = []
+    if visao.detectar_itens_chao(img, "semente"):
+        falhas.append("sementes: 'Limpwurt seed' real foi tomada por Snape grass seed")
+    casos = [("Snape grass seed", True), ("Limpwurt seed", False), ("Snape seed", False),
+             ("grass seed", False), ("Swetcorn seed", False), ("Limpwurt grass seed", False),
+             ("Snape Lass seed", False)]
+    for gap in (2, 3):
+        for texto, esperado in casos:
+            quadro, x_fim = montar(texto, gap=gap)
+            achados = [i for i in visao.detectar_itens_chao(quadro, "semente") if abs(i["rotulo"][1] - 699) <= 4]
+            if bool(achados) != esperado:
+                falhas.append(f"sementes: '{texto}' (folga {gap}) {'não foi pega' if esperado else 'foi pega'}")
+            elif achados and abs(achados[0]["pos"][0] - ((700 + x_fim) // 2 - 3)) > 6:
+                falhas.append(f"sementes: '{texto}' (folga {gap}) com a pilha fora do centro: {achados[0]['pos']}")
+    # quadro real com "Grimy ranarr weed", "Marrentill seed" e "Belladonna seed": nem runa nem semente
+    outro = cv2.imread(os.path.join(PASTA, "sementes", "ranarr_marrentill.png"))
+    if outro is not None:
+        for item in ("runa", "semente"):
+            if visao.detectar_itens_chao(outro, item):
+                falhas.append(f"sementes/ranarr_marrentill.png: achou '{item}' (ranarr/outras sementes)")
+    # nenhuma semente nos quadros de runas e moedas
+    outros = sorted(glob.glob(os.path.join(PASTA, "runas", "*.png")))
+    for f in outros:
+        if visao.detectar_itens_chao(cv2.imread(f), "semente"):
+            falhas.append(f"sementes: achou Snape grass seed em runas/{os.path.basename(f)}")
+    # menu: os de osso/runa/moedas com outro item na pilha têm 1 linha desconhecida; sem "Take", nenhuma
+    menus = sorted(glob.glob(os.path.join(PASTA, "menus", "*.png")))
+    com = 0
+    for f in menus:
+        rec = cv2.imread(f)
+        p, _ = visao.achar_take_desconhecido_no_menu(rec)
+        com += p is not None
+        if p is not None and not visao.menu_tem_take(rec):
+            falhas.append(f"sementes: linha desconhecida num menu sem 'Take' (menus/{os.path.basename(f)})")
+    print(f"Snape grass seed: {2 * len(casos)} rótulos montados, {len(outros)} quadros sem semente, "
+          f"{len(menus)} menus ({com} com 1 linha 'Take' desconhecida)")
+    return falhas
+
+
 # Na ordem da saída. Cada item: (função, argumentos...).
 TESTES = [
     (testar_frames,), (testar_faixas,), (testar_cliques,), (testar_menus,),
     (testar_vida_amostras,), (testar_vida_baixa,), (testar_vida_deslocada,), (testar_vida_cenario,),
     (testar_vigia_vida,), (testar_geometria,), (testar_mochila_aberta,),
-    *[t for item in visao.ITENS_CHAO for t in ((testar_item_chao, item), (testar_item_menu, item))],
+    *[t for item in GABARITOS_CHAO for t in ((testar_item_chao, item), (testar_item_menu, item))],
+    (testar_semente,),
     (testar_rotulo_vizinho,), (testar_menu_tem_take,), (testar_take_acao,), (testar_rotulo_novo,),
     (testar_perfis_aprendidos,), (testar_moldes_cruzados,), (testar_mira_por_nome,),
     (testar_matiz_vermelho,), (testar_reconexao,),

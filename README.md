@@ -7,8 +7,9 @@ os ossos. Só funciona no **cliente oficial** do jogo para Windows (a janela se 
 ## O que ele faz (e o que não faz)
 
 - Ataca o monstro escolhido que estiver mais perto do personagem, um por vez.
-- Depois de cada morte, pega do chão os **Big bones**, as **runas** e as **moedas** (Coins)
-  que caíram perto. Os outros itens ficam no chão.
+- Depois de cada morte, pega do chão os **Big bones**, as **runas**, as **moedas** (Coins) e a
+  **Snape grass seed** que caíram perto. Os outros itens (inclusive as outras sementes) ficam
+  no chão.
 - Enterra os Big bones da mochila (inventário) durante as lutas e enquanto espera o loot
   (fora disso, quando junta 10).
 - Com a vida abaixo de 40%, para de atacar e toca o som de erro do Windows. **Ele não come**:
@@ -115,6 +116,7 @@ Abra um terminal nesta pasta: no Explorador de Arquivos, clique na barra de ende
     python main.py --reaprender            ensina de novo o monstro (F9), por cima do que já sabia
     python main.py --sem-runas             não pega as runas que caem no chão
     python main.py --sem-moedas            não pega as moedas (Coins) do chão
+    python main.py --sem-sementes          não pega as Snape grass seeds do chão
     python main.py --sem-vida              desliga a pausa por vida baixa e também a conferência
                                            da interface na tela e a volta automática ao jogo
                                            (só se o orbe de vida não aparecer)
