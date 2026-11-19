@@ -32,6 +32,9 @@ TEXTOS = {
     "take": _carregar("text_mask_take_osrs.png", cinza=True),
     "banco": _carregar("text_mask_bank_booth_osrs.png", cinza=True),  # "Bank Bank booth"
     "yew": _carregar("text_mask_yew_osrs.png", cinza=True),  # "Chop down Yew tree"
+    "magic": _carregar("text_mask_magic_osrs.png", cinza=True),  # "Chop down Magic tree"
+    "escada_subir": _carregar("text_mask_climb_up_osrs.png", cinza=True),  # "Climb-up Staircase"
+    "escada_descer": _carregar("text_mask_climb_down_osrs.png", cinza=True),  # "Climb-down Staircase"
 }
 ICONE_OSSO = _carregar("inventory_bone_osrs.png")
 # Linha "Take Big bones" do menu de botão direito (média de 20 menus)
@@ -761,6 +764,27 @@ def mascara_rotulos(img):
     return m > 0, cv2.GaussianBlur(m, ROTULO_BLUR, 0)
 
 
+# Rótulo de item valioso: o jogo pinta de azul-claro (BGR 255, 178, 102) o que passa do limite
+# de valor (visto em 16/11: "Ranarr seed (22K gp)" azul; "Snape grass seed (8069 gp)" branco). As
+# sementes procuram nos dois; o resto (ossos, runas, moedas) só no branco, como sempre.
+# Faixa HSV medida no rótulo real: matiz 100-107, saturação 89-154; brilho >= 150 dá o desenho das
+# letras como o limiar do branco dá o dele.
+ROTULO_AZUL_HSV = ((99, 85, 150), (108, 160, 255))
+
+
+def mascara_azul(img):
+    """Só o texto azul-claro dos rótulos de itens valiosos (uint8 0/255)."""
+    return cv2.inRange(cv2.cvtColor(img, cv2.COLOR_BGR2HSV), *ROTULO_AZUL_HSV)
+
+
+def mascara_rotulos_valor(img, azul=None):
+    """Como mascara_rotulos, mas com o texto azul-claro dos itens valiosos junto do branco.
+    `azul`: mascara_azul(img), se já tiver sido calculada."""
+    m = cv2.inRange(img, (ROTULO_BRILHO_MIN + 1,) * 3, (255, 255, 255))
+    m = cv2.bitwise_or(m, mascara_azul(img) if azul is None else azul)
+    return m > 0, cv2.GaussianBlur(m, ROTULO_BLUR, 0)
+
+
 def detectar_ossos_chao(img, origem=(0, 0), mascara=None):
     """Ossos no chão a partir do rótulo 'Big bones': [{'pos': (x, y), 'score': s}].
 
@@ -796,6 +820,9 @@ def detectar_ossos_chao(img, origem=(0, 0), mascara=None):
 # Coins (N)" >= 0,94; as outras linhas <= 0,73.
 #
 # altura_x/colunas: filtro de letras altas/pernas (None = não usa; "Coins" tem o C e o i).
+# a palavra "seed" (molde real, de um "Limpwurt seed"): o mesmo objeto nas duas sementes, para
+# detectar_itens_chao casar uma vez só
+ROTULO_SEED = cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0)
 ITENS_CHAO = {
     "runa": {
         "rotulo": cv2.GaussianBlur(_carregar("rune_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
@@ -811,19 +838,23 @@ ITENS_CHAO = {
     },
     # "Snape grass seed [x N] (P gp)": a palavra "seed" (molde real, de um "Limpwurt seed") e
     # antes dela "Snape grass" (molde real, _snape_grass) — as outras sementes não passam.
-    # Sem molde de menu (nenhuma foto do menu dela ainda): achar_take_item_no_menu pega a
-    # única linha "Take" que não é osso, runa nem moedas.
     "semente": {
-        "rotulo": cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
-        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "snape_grass",
-        "menu": None,
+        "rotulo": ROTULO_SEED,
+        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "snape_grass", "cores_valor": True,
+        # no menu: "Snape grass" real (laranja, de um "Take Snape grass seed" de 16/11 numa pilha com
+        # Steel arrow e Big bones: 1,0 na linha certa, <= 0,61 nas outras)
+        "menu": _carregar("menu_snape_word_osrs.png", cinza=True),
+        "menu_limiar": 0.85, "menu_altura_x": None, "menu_colunas": None,
     },
     # "Ranarr seed [x N] (P gp)": o mesmo "seed" e, antes dele, uma palavra que começa com
     # maiúscula e termina com o "anarr" real de um "Grimy ranarr weed" (_ranarr).
+    # O rótulo dela costuma vir azul-claro (valiosa: "cores_valor"); no menu, a palavra "Ranarr"
+    # real (laranja, de um "Take Ranarr seed" de 16/11: 1,0 na linha certa, <= 0,65 nas outras).
     "semente_ranarr": {
-        "rotulo": cv2.GaussianBlur(_carregar("seed_label_osrs.png", cinza=True), ROTULO_BLUR, 0),
-        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "ranarr",
-        "menu": None,
+        "rotulo": ROTULO_SEED,
+        "limiar": 0.85, "altura_x": None, "colunas": None, "conferir": "ranarr", "cores_valor": True,
+        "menu": _carregar("menu_ranarr_word_osrs.png", cinza=True),
+        "menu_limiar": 0.85, "menu_altura_x": None, "menu_colunas": None,
     },
 }
 ROTULO_ENTRE_LINHAS = 22  # px entre rótulos empilhados sobre a mesma pilha
@@ -841,6 +872,10 @@ ROTULO_ESPACO_MAX = 10
 # Estrutura do rótulo em volta da palavra casada: quantas palavras antes dela e quantas
 # depois, com e sem o "x N" de quantidade. Runa: "<Nome> rune [x N] (P gp)"; moedas:
 # "Coins [x N]".
+# px do começo do rótulo até o centro, para quando o fim dele está encavalado em outro rótulo:
+# "Snape grass seed (8069 gp)" medido no rótulo real (848 -> 947,5); "Ranarr seed (NNNNN gp)"
+# estimado pelas letras (~170 px de largura)
+INICIO_ATE_CENTRO = {"semente": 100, "semente_ranarr": 85}
 ESTRUTURA_ROTULO = {"runa": (1, 4, 2), "moedas": (0, 2, 0), "semente": (2, 4, 2), "semente_ranarr": (1, 4, 2)}
 DENTRO_MARGEM = 6  # px da borda da área do jogo: clique mais perto que isso é recusado
 
@@ -917,6 +952,10 @@ def _centro_rotulo(binm, topo, x_meio, item, limites):
             and not binm[topo:topo + 4, t1[0]:t1[1] + 1].any())
     i0, i1 = k - antes, k + (depois_com_x if eh_x else depois_sem_x)
     if i0 < 0 or i1 >= len(ws) or not all(junto(i) for i in range(i0, i1)):
+        # o fim do rótulo encavalado em outro (visto: "Snape grass see" + "Big bones (297 gp)"):
+        # item raro e com o começo conferido — o centro sai do começo do rótulo
+        if item in INICIO_ATE_CENTRO and i0 >= 0 and all(junto(i) for i in range(i0, k))                 and ws[i0][0] > limites[0] + 1:
+            return ws[i0][0] + INICIO_ATE_CENTRO[item]
         return None
     esq, dir_ = ws[i0][0], ws[i1][1]
     if esq <= limites[0] + 1 or dir_ >= limites[1] - 2:
@@ -934,6 +973,19 @@ SNAPE_GRASS = _carregar("snape_grass_label_osrs.png", cinza=True)
 SNAPE_LARGURA = (38, 44)
 GRASS_LARGURA = (36, 42)
 SNAPE_GRASS_NOTA = 0.8  # nota de "Snape grass" antes do "seed" (o próprio molde dá 1,0)
+# O jogo às vezes desenha uma letra 1 px para o lado (visto em 16/11: a nota exata caiu de 1,0
+# para 0,69 e a semente ficou no chão). Comparando as duas imagens borradas, o mesmo rótulo
+# dá 0,91 e o par de palavras de largura parecida mais próximo, 0,59.
+PALAVRA_BLUR = (5, 5)
+
+
+def _nota_palavra(binm, y1, y2, x1, x2, molde):
+    """Nota (borrada, tolera letra 1 px para o lado) do `molde` na região binm[y1:y2, x1:x2]."""
+    reg = binm[max(y1, 0):y2, max(x1, 0):x2].astype(np.float32)
+    if reg.shape[0] < molde.shape[0] or reg.shape[1] < molde.shape[1]:
+        return 0.0
+    tpl = cv2.GaussianBlur((molde > 127).astype(np.float32), PALAVRA_BLUR, 0)
+    return float(cv2.matchTemplate(cv2.GaussianBlur(reg, PALAVRA_BLUR, 0), tpl, cv2.TM_CCOEFF_NORMED).max())
 
 
 def _snape_grass(binm, topo, x_meio):
@@ -952,10 +1004,7 @@ def _snape_grass(binm, topo, x_meio):
             and SNAPE_LARGURA[0] <= s2 - s1 + 1 <= SNAPE_LARGURA[1]):
         return False
     th, tw = SNAPE_GRASS.shape
-    reg = binm[max(topo - 4, 0):topo - 2 + th + 2, max(s1 - 3, 0):s1 - 1 + tw + 3].astype(np.uint8) * 255
-    if reg.shape[0] < th or reg.shape[1] < tw:
-        return False
-    return float(cv2.matchTemplate(reg, SNAPE_GRASS, cv2.TM_CCOEFF_NORMED).max()) >= SNAPE_GRASS_NOTA
+    return _nota_palavra(binm, topo - 4, topo - 2 + th + 2, s1 - 3, s1 - 1 + tw + 3, SNAPE_GRASS) >= SNAPE_GRASS_NOTA
 
 
 RUNE_LARGURA = (27, 34)  # px da palavra "rune" no rótulo (medido em 62 rótulos: 30-31)
@@ -993,12 +1042,8 @@ def _ranarr(binm, topo, x_meio):
     altas = binm[topo + ROTULO_ALTAS[0]:topo + ROTULO_ALTAS[1]].any(axis=0)
     if not altas[g1:g1 + 8].any() or altas[g1 + 9:g2 + 1].any():
         return False
-    th, tw = ANARR.shape
-    y1, x1 = topo - 2 - 2, g2 + 1 - tw - 2  # 2 px de folga em volta, para cada lado
-    reg = binm[max(y1, 0):topo - 2 + th + 2, max(x1, 0):g2 + 1 + 2].astype(np.uint8) * 255
-    if reg.shape[0] < th or reg.shape[1] < tw:
-        return False
-    return float(cv2.matchTemplate(reg, ANARR, cv2.TM_CCOEFF_NORMED).max()) >= RANARR_NOTA
+    th, tw = ANARR.shape  # 2 px de folga em volta, para cada lado
+    return _nota_palavra(binm, topo - 4, topo - 2 + th + 2, g2 + 1 - tw - 2, g2 + 3, ANARR) >= RANARR_NOTA
 
 
 CONFERIR_ROTULO = {"snape_grass": _snape_grass, "largura_rune": _largura_rune, "ranarr": _ranarr}
@@ -1059,6 +1104,24 @@ def _centro_abaixo(binm, topo, centro, tolerancia=8):
     return c2
 
 
+def _item_da_pilha(binm, topo, centro, origem):
+    """Onde clicar para abrir o menu da pilha do rótulo em (centro, topo): desce pela pilha
+    enquanto houver outro rótulo dela logo abaixo e devolve o ponto embaixo do último (coordenadas
+    da janela). Os rótulos da mesma pilha são centrados no mesmo item: se o de cima saiu torto (o
+    fim dele encostou no rótulo de outra pilha, visto em jogo com "Coins x 52" e "Iron
+    kiteshield"), o de baixo corrige o centro."""
+    for _ in range(ROTULO_MAX_PILHA):
+        c2 = _centro_abaixo(binm, topo, centro, ROTULO_DESCIDA_TOLERANCIA)
+        if c2 is None:
+            break
+        topo += ROTULO_ENTRE_LINHAS
+        centro = c2
+    return origem[0] + centro + ROTULO_ITEM[0], origem[1] + topo + ROTULO_ITEM[1]
+
+
+_casado = {"mask": None, "tpl": None, "res": None}  # último casar_rotulo de detectar_itens_chao
+
+
 def detectar_itens_chao(img, item, origem=(0, 0), ossos=None, mascara=None):
     """Itens no chão pelo rótulo: [{'pos': (x, y) da pilha, 'score': s, 'rotulo': (x, y)}].
 
@@ -1068,8 +1131,18 @@ def detectar_itens_chao(img, item, origem=(0, 0), ossos=None, mascara=None):
     para a mesma imagem (calculado se faltar); `mascara`: resultado de mascara_rotulos(img).
     """
     cfg = ITENS_CHAO[item]
-    binm, mask = mascara_rotulos(img) if mascara is None else mascara
-    res = casar_rotulo(mask, cfg["rotulo"])
+    if mascara is not None:  # quem chama passa a máscara certa (mascara_rotulos_valor para as sementes)
+        binm, mask = mascara
+    elif cfg.get("cores_valor"):  # rótulo branco ou azul-claro (valioso)
+        binm, mask = mascara_rotulos_valor(img)
+    else:
+        binm, mask = mascara_rotulos(img)
+    # as duas sementes usam o mesmo molde ("seed") na mesma máscara: casa uma vez só
+    if _casado["mask"] is mask and _casado["tpl"] is cfg["rotulo"]:
+        res = _casado["res"]
+    else:
+        res = casar_rotulo(mask, cfg["rotulo"])
+        _casado.update(mask=mask, tpl=cfg["rotulo"], res=res)
     # Bordas para o rótulo não ser considerado cortado: as da imagem e as da área do jogo
     cx, _, cw, _ = CLIENTE_CALIBRADO
     limites = (max(0, cx - origem[0]), min(binm.shape[1], cx + cw - origem[0]))
@@ -1086,17 +1159,7 @@ def detectar_itens_chao(img, item, origem=(0, 0), ossos=None, mascara=None):
         centro = _centro_rotulo(binm, topo, x_meio, item, limites)
         if centro is None:
             continue  # incerto: melhor não clicar do que clicar em outra pilha
-        # desce pela pilha enquanto houver outro rótulo dela logo abaixo. Os rótulos da
-        # mesma pilha são centrados no mesmo item: se o de cima saiu torto (o fim dele
-        # encostou no rótulo de outra pilha, visto em jogo com "Coins x 52" e "Iron
-        # kiteshield"), o de baixo corrige o centro.
-        for _ in range(ROTULO_MAX_PILHA):
-            c2 = _centro_abaixo(binm, topo, centro, ROTULO_DESCIDA_TOLERANCIA)
-            if c2 is None:
-                break
-            topo += ROTULO_ENTRE_LINHAS
-            centro = c2
-        pos = (origem[0] + centro + ROTULO_ITEM[0], origem[1] + topo + ROTULO_ITEM[1])
+        pos = _item_da_pilha(binm, topo, centro, origem)
         # Rótulo de outra pilha encavalado no de baixo atrapalha a descida; se houver um
         # osso logo abaixo na mesma coluna (até uma linha), a pilha é a dele.
         if ossos is None:
@@ -1188,6 +1251,124 @@ def achar_take_desconhecido_no_menu(img_regiao):
     return None, 0.0
 
 
+# ---------- Itens valiosos: qualquer rótulo azul ----------
+# O jogo pinta de azul-claro o rótulo do que passa do limite de valor (16/11: "Ranarr seed (22K gp)"
+# e "Snapdragon seed (36K gp)" azuis; "Snape grass seed (7842 gp)", "Steel bar (497 gp)" brancos).
+# Pega qualquer um, sem molde do nome: o rótulo (só a parte azul) dá a linha inteira, e a última
+# palavra tem que ser o "gp)" real (reflexo azul do cenário não termina assim).
+# "gp)" de um rótulo real ("Snapdragon seed (36K gp)", 16/11): 19 linhas a partir de 2 acima do
+# topo das maiúsculas.
+ROTULO_GP = _carregar("gp_label_osrs.png", cinza=True)
+ROTULO_GP_NOTA = 0.8
+ROTULO_ALTURA = (12, 24)  # px da linha azul dilatada: maiúsculas + pernas (medido: 20)
+# No menu, a mesma palavra sai ~1,15x mais larga (fonte em negrito; 10 palavras medidas em 2 menus
+# reais: erro <= 1,5 px). O nome do rótulo esticado assim, borrado, contra o texto de cada linha
+# "Take": 0,785-0,850 na linha certa e <= 0,668 nas outras ("Steel bar" x "Steel arrow"; Snapdragon
+# x Harralander, que tem a mesma largura: 0,578).
+VALIOSO_MENU_ESCALA = 1.15
+VALIOSO_MENU_NOTA = 0.72
+VALIOSO_MENU_FOLGA = 0.08  # a linha escolhida tem que ganhar da 2ª melhor por isso
+
+
+def _eh_x(binm, topo, palavra):
+    """A palavra é o "x" da quantidade ("x 30")? Estreita e sem tinta na altura das maiúsculas."""
+    a, b = palavra
+    return b - a <= 9 and not binm[topo:topo + 4, a:b + 1].any()
+
+
+def detectar_valiosos_chao(img, origem=(0, 0), azul=None, mascara=None):
+    """Itens com rótulo azul (valiosos) no chão: [{'pos', 'score', 'rotulo', 'nome'}].
+
+    `pos`: onde clicar para abrir o menu da pilha (embaixo do último rótulo dela); `score`: nota
+    do "gp)"; `nome`: recorte do nome do item no rótulo (0/255), para achar a linha no menu
+    (achar_take_valioso_no_menu). O que os coletores da Ranarr seed e da Snape grass seed acham fica
+    de fora (eles têm o nome conferido e contador; o que eles não reconhecerem, este pega).
+    `azul`: mascara_azul(img); `mascara`: mascara_rotulos_valor(img) (para descer pela pilha, que
+    mistura rótulos brancos e azuis)."""
+    azul = mascara_azul(img) if azul is None else azul
+    if cv2.countNonZero(azul) < ROTULO_LARGURA_MIN:
+        return []
+    binm = azul > 0
+    mascara = mascara_rotulos_valor(img, azul) if mascara is None else mascara
+    pilha = mascara[0]
+    proprios = None  # "seed" das sementes com coletor próprio (calculado só se houver rótulo azul)
+    cx, _, cw, _ = CLIENTE_CALIBRADO
+    limites = (max(0, cx - origem[0]), min(binm.shape[1], cx + cw - origem[0]))
+    linhas = cv2.dilate(azul, np.ones((3, ROTULO_ESPACO_MAX), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(linhas, connectivity=8)
+    achados = []
+    for k in range(1, n):
+        x, y, w, h = (int(v) for v in st[k, :4])
+        if w < ROTULO_LARGURA_MIN or not ROTULO_ALTURA[0] <= h <= ROTULO_ALTURA[1]:
+            continue
+        if na_interface((origem[0] + x, origem[1] + y)):
+            continue
+        tinta = np.flatnonzero(binm[y:y + h, x:x + w].any(axis=1))
+        # a 1ª linha com tinta é o topo das maiúsculas ou a ponta do "(", 1 px acima (varia com a
+        # escala: visto 692/693 e 644/644 nos rótulos da Ranarr)
+        topo = y + int(tinta[0]) + 1
+        ws = _palavras(binm[topo:topo + 13].any(axis=0), x, x + w)
+        if len(ws) < 3:
+            continue  # nome + "(N" + "gp)"
+        g2 = ws[-1][1]
+        th, tw = ROTULO_GP.shape
+        nota = _nota_palavra(binm, topo - 4, topo - 2 + th + 2, g2 + 1 - tw - 2, g2 + 3, ROTULO_GP)
+        if nota < ROTULO_GP_NOTA:
+            continue
+        nome = ws[:-2]
+        if len(nome) >= 3 and _eh_x(binm, topo, nome[-2]):
+            nome = nome[:-2]  # "<nome> x N (P gp)"
+        if proprios is None:  # (a mesma máscara: o casamento do "seed" sai do cache)
+            proprios = [(rx - origem[0], ry - origem[1]) for item in ("semente_ranarr", "semente")
+                        for rx, ry in (d["rotulo"] for d in detectar_itens_chao(img, item, origem, [], mascara))]
+        if any(x <= rx <= x + w and y - 4 <= ry <= y + h for rx, ry in proprios):
+            continue
+        esq, dir_ = ws[0][0], ws[-1][1]
+        if esq <= limites[0] + 1 or dir_ >= limites[1] - 2:
+            continue  # cortado na borda: o centro visível não é o do rótulo
+        # desce pela pilha com os dois topos possíveis e fica com o que desce mais (o degrau entre
+        # as linhas é conferido a 1 px; com o topo 1 px errado a descida parava na 1ª linha)
+        pos = max((_item_da_pilha(pilha, t, (esq + dir_) // 2, origem) for t in (topo - 1, topo)),
+                  key=lambda p: p[1])
+        if na_interface(pos) or not dentro_do_jogo(pos):
+            continue
+        recorte = azul[max(topo - 2, 0):topo + 17, nome[0][0]:nome[-1][1] + 1].copy()
+        achados.append({"pos": pos, "score": round(nota, 3), "rotulo": (origem[0] + esq, origem[1] + topo),
+                        "nome": recorte})
+    return achados
+
+
+def achar_take_valioso_no_menu(img_regiao, nome):
+    """A linha "Take <item>" do menu cujo texto tem o desenho do `nome` lido no rótulo azul
+    (detectar_valiosos_chao), esticado para a fonte do menu. Devolve ((x, y) do "Take", nota) ou
+    (None, melhor nota): sem linha boa o bastante, ou duas parecidas demais (não adivinha)."""
+    mt = mascara_texto(img_regiao)
+    th, tw = MENU_TAKE_PALAVRA.shape
+    rt = cv2.matchTemplate(mt, MENU_TAKE_PALAVRA, cv2.TM_CCOEFF_NORMED)
+    linhas = picos(rt, MENU_TAKE_THRESHOLD, 30, 8, limite=12)
+    if not linhas:
+        return None, float(rt.max()) if rt.size else 0.0
+    largura = max(round(nome.shape[1] * VALIOSO_MENU_ESCALA), 1)
+    tpl = cv2.GaussianBlur(cv2.resize(nome, (largura, nome.shape[0]), interpolation=cv2.INTER_LINEAR)
+                           .astype(np.float32), PALAVRA_BLUR, 0)
+    texto = (mt > 100).astype(np.float32) * 255
+    notas = []
+    for x, y, _ in linhas:
+        reg = texto[max(y - 6, 0):y + th + 8, max(x + tw - 4, 0):x + tw + 330]
+        if reg.shape[0] < tpl.shape[0] or reg.shape[1] < tpl.shape[1]:
+            continue
+        nota = float(cv2.matchTemplate(cv2.GaussianBlur(reg, PALAVRA_BLUR, 0), tpl, cv2.TM_CCOEFF_NORMED).max())
+        notas.append((nota, (x + tw // 2, y + th // 2)))
+    if not notas:
+        return None, 0.0
+    notas.sort(reverse=True)
+    melhor, pos = notas[0]
+    segunda = notas[1][0] if len(notas) > 1 else 0.0
+    if melhor >= VALIOSO_MENU_NOTA and melhor - segunda >= VALIOSO_MENU_FOLGA:
+        return pos, melhor
+    return None, melhor
+
+
 def menu_tem_take(img_regiao):
     """O menu aberto tem alguma linha "Take ..."? Sem nenhuma, o clique caiu num quadrado
     do chão sem itens (o menu só tem "Walk here" e "Cancel")."""
@@ -1230,7 +1411,7 @@ def carregar_referencias(refs):
     return [(nome, tile, _carregar(arquivo)) for nome, (arquivo, tile) in refs.items()]
 
 
-def localizar(img_minimapa, referencias):
+def localizar(img_minimapa, referencias, score_min=None):
     """Posição do jogador em tiles, comparando o minimapa atual com fotos de referência.
 
     Cada referência é o minimapa fotografado num tile conhecido. O miolo dela é
@@ -1249,7 +1430,7 @@ def localizar(img_minimapa, referencias):
             dx, dy = loc[0] + r - cx, loc[1] + r - cy
             pos = (tile[0] - dx / MM_PX_TILE, tile[1] - dy / MM_PX_TILE)
             melhor = (pos, float(score), nome)
-    if melhor[1] < MM_SCORE_MIN:
+    if melhor[1] < (MM_SCORE_MIN if score_min is None else score_min):
         return None, melhor[1], melhor[2]
     return melhor
 
@@ -1313,10 +1494,14 @@ def inventario_cheio(img_inventario):
 
 
 # ---------- Árvores ----------
-def fracao_copa(img, pos, raio=40):
+COPA_HSV = ((28, 90, 20), (42, 255, 95))  # copa de Yew sobre chão marrom (Edgeville)
+
+
+def fracao_copa(img, pos, raio=40, faixa=COPA_HSV):
     """Fração de pixels com cor de copa (verde escuro) numa caixa em volta de `pos`.
 
     Árvore em pé: copa cobre a caixa. Toco: só aparece o chão marrom (matiz 22-25).
+    `faixa`: (mínimo, máximo) em HSV; onde o chão é grama, a faixa tem que deixá-la de fora.
     """
     x, y = int(pos[0]), int(pos[1])
     h, w = img.shape[:2]
@@ -1324,5 +1509,5 @@ def fracao_copa(img, pos, raio=40):
     if rec.size == 0:
         return 0.0
     hsv = cv2.cvtColor(rec, cv2.COLOR_BGR2HSV)
-    copa = cv2.inRange(hsv, np.array([28, 90, 20]), np.array([42, 255, 95]))
+    copa = cv2.inRange(hsv, np.array(faixa[0]), np.array(faixa[1]))
     return float((copa > 0).mean())

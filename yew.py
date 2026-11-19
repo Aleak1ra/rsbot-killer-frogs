@@ -14,6 +14,7 @@ from collections import deque
 import cv2
 import numpy as np
 
+import corte
 import tela
 import visao
 
@@ -29,12 +30,6 @@ REFERENCIAS = visao.carregar_referencias({
     "banco": ("minimap_edgeville_banco.png", (0, 0)),
     "yew_n": ("minimap_edgeville_yew_n.png", (-7, 10)),
 })
-
-# ========== Interface do banco ==========
-BOTAO_DEPOSITAR = (1013, 920)  # "Deposit inventory"
-BOTAO_FECHAR = (1069, 62)
-TITULO_BANCO = visao._carregar("bank_title_osrs.png")
-REGIAO_TITULO = (680, 40, 890, 86)
 
 # ========== Parâmetros ==========
 INVENTARIO_CHEIO = 28
@@ -52,7 +47,6 @@ MOVIMENTO_PARADO = 1.0
 # Uma árvore fora de vista só é dada como toco sem olhar se caiu há bem menos que isso;
 # perto do retorno o bot vai até o ponto de observação e confere com os próprios olhos.
 RESPAWN_MINIMO = 100.0
-ESPERA_CAMINHADA = 45.0
 # Onde procurar a árvore em volta do ponto previsto (px)
 VARREDURA = [(0, 0), (0, -30), (-30, 0), (30, 0), (0, 30), (-30, -30), (30, -30), (0, -60)]
 
@@ -60,20 +54,9 @@ LOG = tela.Registro("yew")
 
 
 # ========== Leituras ==========
-def posicao():
-    pos, score, ref = visao.localizar(tela.capturar(visao.MINIMAPA), REFERENCIAS)
-    return pos
-
-
-def logs_no_inventario(img=None):
-    rec = tela.capturar(visao.INVENTARIO) if img is None else visao.recortar(img, visao.INVENTARIO)
-    return visao.slots_ocupados(rec)
-
-
-def banco_aberto():
-    rec = tela.capturar(REGIAO_TITULO)
-    res = cv2.matchTemplate(rec, TITULO_BANCO, cv2.TM_CCOEFF_NORMED)
-    return float(res.max()) >= 0.9
+NAV = corte.Navegador(REFERENCIAS, LOG)
+posicao, ir_para, esperar_parar = NAV.posicao, NAV.ir_para, NAV.esperar_parar
+logs_no_inventario, banco_aberto, fechar_banco = corte.logs_no_inventario, corte.banco_aberto, corte.fechar_banco
 
 
 def ponto_arvore(nome, pos):
@@ -97,72 +80,6 @@ def estado_arvore(nome, img, pos):
     if f <= COPA_TOCO:
         return "toco", f
     return None, f
-
-
-# ========== Movimento ==========
-def parado(amostras=3, intervalo=0.35):
-    """O personagem parou? (mesma posição em leituras seguidas)"""
-    ultima = posicao()
-    for _ in range(amostras - 1):
-        time.sleep(intervalo)
-        atual = posicao()
-        if atual != ultima:
-            return False
-        ultima = atual
-    return ultima is not None
-
-
-def ir_para(alvo, tolerancia=0.6, timeout=ESPERA_CAMINHADA):
-    """Anda até o tile `alvo` clicando no minimapa.
-
-    Se o alvo estiver além do alcance do minimapa, o primeiro clique vai na direção
-    dele; assim que o alvo entra no alcance (ainda andando), o clique final é dado
-    no tile exato — o personagem não chega a parar no meio do caminho.
-    """
-    inicio = time.time()
-    ultima, parado_n, cliques = None, 0, 0
-    clique_final = False
-    while time.time() - inicio < timeout:
-        if not tela.jogo_em_foco():
-            time.sleep(0.5)
-            continue
-        pos = posicao()
-        if pos is None:
-            time.sleep(0.4)
-            continue
-        falta = (alvo[0] - pos[0], alvo[1] - pos[1])
-        if abs(falta[0]) <= tolerancia and abs(falta[1]) <= tolerancia:
-            LOG.ev("ir_para", ok=True, alvo=alvo, dur=round(time.time() - inicio, 2), cliques=cliques)
-            return True
-        parado_n = parado_n + 1 if pos == ultima else 0
-        no_alcance = np.hypot(*falta) * visao.MM_PX_TILE <= visao.MM_RAIO_CLIQUE
-        if ultima is None or parado_n >= 2 or (no_alcance and not clique_final):
-            def ponto_atual():
-                p = posicao()
-                if p is None:
-                    return None
-                return visao.ponto_minimapa((alvo[0] - p[0], alvo[1] - p[1]))
-
-            tela.clicar_minimapa(visao.ponto_minimapa(falta), recalcular=ponto_atual)
-            tela.mover(tela.PONTO_NEUTRO)
-            cliques += 1
-            parado_n = 0
-            clique_final = no_alcance
-            LOG.ev("clique_minimapa", de=pos, falta=falta, final=bool(no_alcance))
-        ultima = pos
-        time.sleep(0.45)
-    LOG.ev("ir_para", ok=False, alvo=alvo, dur=round(time.time() - inicio, 2), cliques=cliques,
-           pos=posicao())
-    return False
-
-
-def esperar_parar(timeout=25.0):
-    inicio = time.time()
-    time.sleep(0.8)
-    while time.time() - inicio < timeout:
-        if parado():
-            return True
-    return False
 
 
 # ========== Ações ==========
@@ -216,34 +133,10 @@ def depositar():
         tela.mover(tela.PONTO_NEUTRO)
         LOG.ev("depositar", ok=False, motivo="cabine", pos=posicao())
         return False
-    tela.mover(BOTAO_DEPOSITAR)
-    time.sleep(0.15)
-    tela.clicar()
-    tela.mover(tela.PONTO_NEUTRO)
-    vazio, _ = tela.esperar(lambda: logs_no_inventario() == 0, 3.0, 0.1)
-    fechou, com_esc = fechar_banco()
-    # Ao fechar o banco o jogo mostra por um instante o inventário antigo (ainda cheio):
-    # espera a contagem voltar a zero e ficar estável antes de devolver o controle.
-    tela.esperar(lambda: logs_no_inventario() == 0, 2.0, 0.1)
-    time.sleep(0.3)
+    vazio, fechou, com_esc = corte.depositar_tudo()
     LOG.ev("depositar", ok=vazio and fechou, logs=antes, dur=round(time.time() - inicio, 2),
            esc=com_esc, depois=logs_no_inventario())
     return vazio and fechou
-
-
-def fechar_banco():
-    """Fecha a interface do banco: Esc e, se a tecla não estiver configurada, o botão X.
-    Devolve (fechou, fechou com Esc)."""
-    tela.tecla("esc")
-    fechou, _ = tela.esperar(lambda: not banco_aberto(), 1.5, 0.1)
-    if fechou:
-        return True, True
-    tela.mover(BOTAO_FECHAR)
-    time.sleep(0.1)
-    tela.clicar()
-    tela.mover(tela.PONTO_NEUTRO)
-    fechou, _ = tela.esperar(lambda: not banco_aberto(), 2.0, 0.1)
-    return fechou, False
 
 
 # ========== Loop ==========

@@ -46,6 +46,8 @@ def _args():
     p.add_argument("--sem-runas", action="store_true", help="não pega as runas que caem no chão")
     p.add_argument("--sem-moedas", action="store_true", help="não pega as moedas (Coins) do chão")
     p.add_argument("--sem-sementes", action="store_true", help="não pega as Snape grass seeds nem as Ranarr seeds do chão")
+    p.add_argument("--sem-valiosos", action="store_true",
+                   help="não pega os outros itens de rótulo azul (valiosos, como a Snapdragon seed)")
     p.add_argument("--amostras", action="store_true",
                    help="salva quadros em amostras/ para o testar_visao.py")
     a = p.parse_args()
@@ -311,6 +313,10 @@ MIRA_DESLOC_MAX = 60
 # Medido: 8 de 9 ataques que falharam tinham >= 36 px de barra; os 47 que deram certo, 0.
 BARRA_SAPO_OCUPADO = 25
 MAX_COLETAS_SEGUIDAS = 2  # coletas do chão entre dois ataques, havendo monstro livre à vista
+# Sementes valiosas (Ranarr ~22K, Snape grass ~8K): pegas antes de tudo, sem o limite acima e até
+# no meio de uma luta (procura a cada VALIOSO_INTERVALO s enquanto luta)
+VALIOSOS = ("semente_ranarr", "semente", "valioso")
+VALIOSO_INTERVALO = 0.5
 
 # Menu de botão direito (pilhas de itens): meia largura/altura da área lida em volta do clique
 MENU_RAIO = (280, 330)
@@ -349,6 +355,7 @@ ABA_INTERVALO = 5.0  # s entre cliques na aba da mochila (garantir_mochila)
 PEGAR_RUNAS = not ARGS.sem_runas
 PEGAR_MOEDAS = not ARGS.sem_moedas
 PEGAR_SEMENTES = not ARGS.sem_sementes  # só Snape grass seed e Ranarr seed (as outras ficam no chão)
+PEGAR_VALIOSOS = not ARGS.sem_valiosos  # qualquer outro item de rótulo azul (o jogo marca os caros)
 ESPERA_PEGAR_ITEM = 2.5  # + dist/150, como os ossos
 # Distância do loot (runas, moedas e ossos): o das próprias lutas cai perto (ossos: 95% a
 # <= 271 px; runas e moedas <= 122 px). O que está longe costuma ser de outros jogadores e
@@ -359,6 +366,7 @@ COLETA_RAIO_MAX = 450  # px: sem monstro à vista, vai buscar até aqui
 # rótulos para os lados, a pilha de rótulos acima e a pilha abaixo do rótulo
 LOOT_MARGEM_LADO, LOOT_MARGEM_ACIMA, LOOT_MARGEM_ABAIXO = 380, 230, 60
 COLETA_IGNORAR_SEG = 60.0  # pilha que falhou fica ignorada por esse tempo (as outras não)
+COLETA_IGNORAR_VALIOSO_SEG = 3.0  # ...a não ser de semente valiosa: outra tentativa logo
 COLETA_IGNORAR_RAIO = 25  # px em volta da pilha que falhou
 COLETA_FALHAS_PAUSA = 3  # falhas seguidas -> deixa aquele item de lado por COLETA_PAUSA s
 COLETA_PAUSA = 30.0
@@ -872,6 +880,8 @@ class ColetaChao:
     tempo, para não travar o bot. Cada falha grava uma foto em logs/coleta_falhas/.
     """
 
+    PEGAS = "pegas"  # "Runas pegas: N"
+
     def __init__(self, item, plural, emoji, ligado):
         self.item, self.plural, self.emoji, self.ligado = item, plural, emoji, ligado
         self.total = 0
@@ -884,13 +894,21 @@ class ColetaChao:
     def ativas(self):
         return self.ligado and time.time() >= self.pausa_ate
 
-    def detectar(self, img, ossos=None, mascara=None, raio=COLETA_RAIO_MAX, origem=(0, 0)):
+    def _detectar(self, img, origem=(0, 0), ossos=None, mascara=None, azul=None):
+        """Os rótulos do item na imagem (sem filtro de distância)."""
+        return visao.detectar_itens_chao(img, self.item, origem=origem, ossos=ossos, mascara=mascara)
+
+    def _achar_menu(self, alvo):
+        """Função que acha a linha "Take" do item no recorte do menu aberto."""
+        return lambda rec: visao.achar_take_item_no_menu(rec, self.item)
+
+    def detectar(self, img, ossos=None, mascara=None, raio=COLETA_RAIO_MAX, origem=(0, 0), azul=None):
         """Itens a até `raio` px do personagem, sem as pilhas que falharam há pouco.
 
         `img` pode ser um recorte da janela com canto em `origem` (ver recorte_loot)."""
         agora = time.time()
         self.ignoradas = [(p, t) for p, t in self.ignoradas if t > agora]
-        itens = visao.detectar_itens_chao(img, self.item, origem=origem, ossos=ossos, mascara=mascara)
+        itens = self._detectar(img, origem=origem, ossos=ossos, mascara=mascara, azul=azul)
         if agora < self.recem_ate:  # o rótulo da pilha recém-pega ainda aparece um instante
             itens = [i for i in itens
                      if dist_segmento(i["pos"], self.recem_pos, CENTRO) > COLETA_RECEM_PEGO[1]]
@@ -924,8 +942,12 @@ class ColetaChao:
         self._foto_falha(img, alvo, motivo, depois)
         if ignorar == "alvo":
             ignorar = alvo["pos"]
+        valioso = self.item in VALIOSOS  # semente: tenta de novo logo, antes que outro jogador pegue
         if ignorar is not None:
-            self.ignoradas.append((ignorar, time.time() + COLETA_IGNORAR_SEG))
+            seg = COLETA_IGNORAR_VALIOSO_SEG if valioso else COLETA_IGNORAR_SEG
+            self.ignoradas.append((ignorar, time.time() + seg))
+        if valioso:
+            return  # e nunca deixa as sementes de lado por falhas seguidas
         self.falhas += 1
         if self.falhas >= COLETA_FALHAS_PAUSA:
             self.falhas = 0
@@ -936,8 +958,16 @@ class ColetaChao:
 
     def pegar(self, img, itens):
         alvo = min(itens, key=lambda r: distancia(CENTRO, r["pos"]))
-        pos = mirar_parado(alvo["pos"], lambda rec, o: [
-            i["pos"] for i in visao.detectar_itens_chao(rec, self.item, origem=o)])
+        # Os valiosos são procurados também no meio de uma luta, inclusive logo depois do ataque a um
+        # monstro longe, com o personagem andando e a tela deslizando (visto em 17/11: a mira
+        # conferiu num instante parado da câmera, o menu abriu ~90 px fora da pilha e a Snape grass
+        # seed ficou para trás). Só tenta com a tela parada; senão, o próximo ciclo tenta de novo.
+        if self.item in VALIOSOS:
+            parada = esperar_tela_parar()
+            if not parada["ok"]:
+                LOG.ev("valioso_andando", item=self.item, seg=parada["seg"])
+                return False
+        pos = mirar_parado(alvo["pos"], lambda rec, o: [i["pos"] for i in self._detectar(rec, origem=o)])
         if pos is None:
             LOG.ev("mira_perdida", item=self.item)
             _mira["perdida"] = True
@@ -952,8 +982,7 @@ class ColetaChao:
         inv_antes = capturar(visao.INVENTARIO_ITENS)
         mover(pos)
         time.sleep(0.05)
-        achar = lambda rec: visao.achar_take_item_no_menu(rec, self.item)  # noqa: E731
-        r = pegar_pelo_menu_pilha(pos, achar, self.item)
+        r = pegar_pelo_menu_pilha(pos, self._achar_menu(alvo), self.item)
         if r is None:
             return False  # clique cancelado: não é falha da pilha
         if not r:
@@ -988,26 +1017,42 @@ class ColetaChao:
             self.recem_ate = time.time() + COLETA_RECEM_PEGO[0]
             self.recem_pos = pos
             _ultima_coleta.update(t=time.time(), dist=dist)
-            print(f"{self.emoji} {self.plural.capitalize()} pegas: {self.total}")
-            if self.item.startswith("semente"):  # sem foto real do rótulo ainda: guarda para conferir
-                foto_diagnostico("semente_ok", img)
+            print(f"{self.emoji} {self.plural.capitalize()} {self.PEGAS}: {self.total}")
+            if self.item in VALIOSOS:  # raros: guarda o quadro para conferir o que foi pego
+                foto_diagnostico("valioso_ok" if self.item == "valioso" else "semente_ok", img)
         else:
             # o personagem andou até a pilha: ela (se ficou) está agora perto dele
             depois = capturar()
-            perto = [i["pos"] for i in visao.detectar_itens_chao(depois, self.item)
+            perto = [i["pos"] for i in self._detectar(depois)
                      if distancia(i["pos"], CENTRO) <= COLETA_SOB_PERSONAGEM]
             onde = min(perto, key=lambda p: distancia(p, CENTRO)) if perto else None
             self._falhou(img, alvo, "inventario_igual", depois=depois, ignorar=onde)
         return True
 
 
+class ColetaValiosa(ColetaChao):
+    """Qualquer item de rótulo azul (o jogo marca assim os que passam do limite de valor), sem
+    molde do nome: a linha do menu sai do desenho do nome lido no próprio rótulo
+    (visao.detectar_valiosos_chao e visao.achar_take_valioso_no_menu)."""
+
+    PEGAS = "pegos"
+
+    def _detectar(self, img, origem=(0, 0), ossos=None, mascara=None, azul=None):
+        return visao.detectar_valiosos_chao(img, origem=origem, azul=azul, mascara=mascara)
+
+    def _achar_menu(self, alvo):
+        return lambda rec: visao.achar_take_valioso_no_menu(rec, alvo["nome"])
+
+
 _fotos_falha = 0
-# Ordem de prioridade: Ranarr seed e Snape grass seed (raras), runas, moedas (os ossos vêm depois, no laço)
+# Ordem de prioridade: Ranarr seed e Snape grass seed, os outros itens de rótulo azul (raros e
+# caros), runas, moedas (os ossos vêm depois, no laço)
 RUNAS = ColetaChao("runa", "runas", "🔮", PEGAR_RUNAS)
 MOEDAS = ColetaChao("moedas", "moedas", "🪙", PEGAR_MOEDAS)
 SEMENTES = ColetaChao("semente", "Snape grass seeds", "🌱", PEGAR_SEMENTES)
 RANARR = ColetaChao("semente_ranarr", "Ranarr seeds", "🌿", PEGAR_SEMENTES)
-COLETAS = (RANARR, SEMENTES, RUNAS, MOEDAS)
+VALIOSO = ColetaValiosa("valioso", "itens valiosos (rótulo azul)", "💎", PEGAR_VALIOSOS)
+COLETAS = (RANARR, SEMENTES, VALIOSO, RUNAS, MOEDAS)
 
 
 def atacar_sapo(img, sapos, t_quadro=None):
@@ -1142,11 +1187,26 @@ def esperar_tela_parar():
     return {"ok": False, "seg": round(time.perf_counter() - inicio, 2)}
 
 
-def coletar_chao(img, raio, coletar):
-    """Uma coleta do chão em volta do personagem: runas e moedas primeiro (valem mais e caem
-    na mesma pilha), depois ossos (se `coletar`). Devolve (agiu, t): agiu = "osso", True (outro
+def coletar_chao(img, raio, coletar, so_valiosos=False):
+    """Uma coleta do chão em volta do personagem: os valiosos (sementes e rótulos azuis) antes de
+    tudo (até COLETA_RAIO_MAX, haja monstro à vista ou não), depois runas e moedas (valem mais e
+    caem na mesma pilha) e ossos (se `coletar`) até `raio`. `so_valiosos`: só os valiosos (no
+    limite de coletas entre ataques e no meio de uma luta). Devolve (agiu, t): agiu = "osso", True (outro
     item) ou False; t = perf_counter do fim da detecção (o tempo 'rotulos' do log)."""
-    coletas = [c for c in COLETAS if c.ativas()]
+    valiosas = [c for c in COLETAS if c.ativas() and c.item in VALIOSOS]
+    if valiosas:
+        x1, y1, x2, y2 = recorte_loot(COLETA_RAIO_MAX)
+        sub = img[y1:y2, x1:x2]
+        azul = visao.mascara_azul(sub)
+        mv = visao.mascara_rotulos_valor(sub, azul)  # branco + azul-claro, uma vez para todos
+        for coleta in valiosas:  # (ossos=[]: sem o ajuste pela pilha do osso; poupa ~27 ms por ciclo)
+            itens = coleta.detectar(sub, ossos=[], mascara=mv, raio=COLETA_RAIO_MAX, origem=(x1, y1),
+                                    azul=azul)
+            if itens and coleta.pegar(img, itens):
+                return True, time.perf_counter()
+    if so_valiosos:
+        return False, time.perf_counter()
+    coletas = [c for c in COLETAS if c.ativas() and c.item not in VALIOSOS]
     if not (coletar or coletas):
         return False, time.perf_counter()
     # só o recorte que pode ter loot dentro do raio (metade do tempo com raio 280)
@@ -1228,6 +1288,7 @@ def loop_principal():
     inicio_luta = 0.0
     livre_desde = None  # em luta, o painel do oponente sumiu desde então (COMBATE_LIVRE_SEG)
     coletas_seguidas = 0  # coletas do chão desde a última tentativa de ataque
+    ultimo_valioso = 0.0  # última procura de semente valiosa no meio de uma luta
     em_foco = True
     avisou_inativo = False
     vigia_vida = VIGIA_VIDA  # do módulo: um recomeço do laço (erro) não esquece a pausa
@@ -1428,6 +1489,14 @@ def loop_principal():
                 em_luta = True
                 inicio_luta = time.time()
                 LOG.ev("combate_externo")
+            # semente valiosa no chão: larga a luta um instante e pega (outro jogador a pegaria; o
+            # monstro continua no personagem e a luta segue depois). Visto em 16/11: uma Ranarr
+            # seed (22K) ficou no chão enquanto o bot lutava.
+            if time.time() - ultimo_valioso >= VALIOSO_INTERVALO:
+                ultimo_valioso = time.time()
+                if coletar_chao(img, COLETA_RAIO_MAX, False, so_valiosos=True)[0]:
+                    LOG.ev("valioso_em_luta")
+                    continue
             if inventario and ENTERRO.pode():
                 ENTERRO.um(inventario, "combate")
             time.sleep(0.1)
@@ -1455,10 +1524,8 @@ def loop_principal():
         # 152 de 302 s entre lutas eram coleta). O que sobra é pego depois da próxima luta.
         livre = coletas_seguidas >= MAX_COLETAS_SEGUIDAS and any(
             visao.barra_vida_perto(img, s["pos"], *PERFIL["barra"]) < BARRA_SAPO_OCUPADO for s in sapos)
-        if livre:
-            agiu = False
-        else:
-            agiu, t4 = coletar_chao(img, raio, coletar)
+        # (as sementes valiosas não entram no limite: são pegas antes que outro jogador as pegue)
+        agiu, t4 = coletar_chao(img, raio, coletar, so_valiosos=livre)
         if agiu == "osso":
             ossos_pegos += 1
             print(f"🦴 Ossos coletados do chão: {ossos_pegos}")

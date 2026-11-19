@@ -942,7 +942,7 @@ def testar_semente():
     falhas = []
     if visao.detectar_itens_chao(img, "semente"):
         falhas.append("sementes: 'Limpwurt seed' real foi tomada por Snape grass seed")
-    casos = [("$ seed", True), ("Snape grass seed", False), ("Limpwurt seed", False), ("Snape seed", False),
+    casos = [("$ seed", True), ("Limpwurt seed", False), ("Snape seed", False),
              ("grass seed", False), ("Swetcorn seed", False), ("Limpwurt grass seed", False),
              ("Snape Lass seed", False)]
     for gap in (2, 3):
@@ -962,6 +962,39 @@ def testar_semente():
             falhas.append(f"sementes/snape_real.png: esperava 1 Snape grass seed em (942, 695), achou {a}")
         if visao.detectar_itens_chao(real, "semente_ranarr"):
             falhas.append("sementes/snape_real.png: Snape grass seed tomada por Ranarr seed")
+    # Ranarr seed real (16/11, print do jogo: monitor inteiro, a captura começa 9 px antes): rótulo
+    # AZUL-CLARO (item valioso) numa pilha com Steel bar e Harralander seed; o menu da pilha tem 3
+    # "Take" e o bot tem que achar o "Take Ranarr seed"
+    for nome in ("ranarr_tela1.png", "ranarr_tela2_menu.png"):
+        mon = cv2.imread(os.path.join(PASTA, "sementes", nome))
+        if mon is None:
+            continue
+        quadro = np.zeros((visao.CAPTURA_CALIBRADA[1], visao.CAPTURA_CALIBRADA[0], 3), np.uint8)
+        quadro[9:, 9:9 + mon.shape[1]] = mon[:quadro.shape[0] - 9, :quadro.shape[1] - 9]
+        a = visao.detectar_itens_chao(quadro, "semente_ranarr")
+        if len(a) != 1 or abs(a[0]["pos"][0] - 829) > 8 or abs(a[0]["pos"][1] - 769) > 8:
+            falhas.append(f"sementes/{nome}: esperava 1 Ranarr seed perto de (829, 769), achou {a}")
+        if visao.detectar_itens_chao(quadro, "semente"):
+            falhas.append(f"sementes/{nome}: Ranarr seed tomada por Snape grass seed")
+        if nome == "ranarr_tela2_menu.png":
+            p, nota = visao.achar_take_item_no_menu(quadro[759:984, 714:944], "semente_ranarr")
+            if p is None or abs(p[1] - 65) > 4:
+                falhas.append(f"sementes/{nome}: linha 'Take Ranarr seed' não achada no menu ({p}, {nota:.2f})")
+    # menu real (16/11) de uma pilha Steel arrow + Snape grass seed + Big bones: a linha certa é a 2ª
+    rec = cv2.imread(os.path.join(PASTA, "sementes", "snape_menu.png"))
+    if rec is not None:
+        p, _ = visao.achar_take_item_no_menu(rec, "semente")
+        if p is None or abs(p[1] - 398) > 4:
+            falhas.append(f"sementes/snape_menu.png: linha 'Take Snape grass seed' não achada ({p})")
+        if visao.achar_take_item_no_menu(rec, "semente_ranarr")[0] is not None:
+            falhas.append("sementes/snape_menu.png: achou 'Take Ranarr seed' num menu sem Ranarr")
+    # rótulo real encavalado (16/11): "Snape grass see" + "Big bones (297 gp)" de outra pilha, com
+    # letras 1 px para o lado; a semente estava em (937, 370)
+    enc = cv2.imread(os.path.join(PASTA, "sementes", "snape_encavalada.png"))
+    if enc is not None:
+        a = visao.detectar_itens_chao(enc, "semente")
+        if len(a) != 1 or abs(a[0]["pos"][0] - 937) > 8 or abs(a[0]["pos"][1] - 372) > 8:
+            falhas.append(f"sementes/snape_encavalada.png: esperava 1 Snape grass seed perto de (937, 372), achou {a}")
     # Ranarr seed: "R" + o "anarr" real (folga entre letras 2-3 px, como a fonte do jogo; com 1 px nem o
     # "seed" passa); as parecidas não passam, e uma semente não passa pela outra
     n_ranarr = 0
@@ -1004,13 +1037,83 @@ def testar_semente():
     return falhas
 
 
+def testar_valiosos():
+    """Itens de rótulo azul (detectar_valiosos_chao / achar_take_valioso_no_menu), sem molde do nome:
+    a "Snapdragon seed (36K gp)" real de 16/11 é achada; a Ranarr seed (azul, mas com coletor
+    próprio) e as Snape grass seeds (brancas) não; nenhum outro quadro das amostras tem rótulo
+    azul. No menu, o nome lido no rótulo escolhe a linha certa e só ela."""
+    falhas = []
+    S = os.path.join(PASTA, "sementes")
+    sd_img = cv2.imread(os.path.join(S, "snapdragon_tela.png"))
+    rn_img = cv2.imread(os.path.join(S, "ranarr_tela2_menu.png"))  # monitor sem deslocar: menu e rótulos juntos
+    if sd_img is None or rn_img is None:
+        print("Valiosos: sem dados (amostras/sementes/snapdragon_tela.png e ranarr_tela2_menu.png)")
+        return falhas
+    sd = visao.detectar_valiosos_chao(sd_img)
+    if len(sd) != 1 or abs(sd[0]["pos"][0] - 884) > 6 or abs(sd[0]["pos"][1] - 890) > 6:
+        falhas.append(f"valiosos: esperava 1 Snapdragon seed perto de (884, 890), achou {[i['pos'] for i in sd]}")
+    # pega ao vivo (16/11, no meio de uma luta): pilha Snapdragon seed + Limpwurt seed + Big bones
+    pilha = cv2.imread(os.path.join(S, "snapdragon_pilha.png"))
+    if pilha is not None:
+        a = visao.detectar_valiosos_chao(pilha)
+        if len(a) != 1 or abs(a[0]["pos"][0] - 831) > 6 or abs(a[0]["pos"][1] - 711) > 6:
+            falhas.append(f"valiosos: esperava a pilha da Snapdragon em (831, 711), achou {[i['pos'] for i in a]}")
+    if visao.detectar_valiosos_chao(rn_img):
+        falhas.append("valiosos: a Ranarr seed (coletor próprio) entrou como item valioso genérico")
+    # Ranarr pega ao vivo (17/11) com o rótulo azul encostado no "Mithril shortsword" de outra pilha,
+    # numa pilha de 4 itens: o coletor dela acha; o genérico deixa para ele
+    rp_img = cv2.imread(os.path.join(S, "ranarr_pilha.png"))
+    if rp_img is not None:
+        a = visao.detectar_itens_chao(rp_img, "semente_ranarr")
+        if len(a) != 1 or abs(a[0]["pos"][0] - 932) > 6 or abs(a[0]["pos"][1] - 709) > 6:
+            falhas.append(f"valiosos: Ranarr encavalada fora da pilha (932, 709): {[i['pos'] for i in a]}")
+        if visao.detectar_valiosos_chao(rp_img):
+            falhas.append("valiosos: a Ranarr encavalada (coletor próprio) entrou como item valioso genérico")
+    # sem os coletores próprios, o mesmo rótulo azul desce pela pilha como o coletor dela (a descida
+    # com o topo 1 px errado parava na 1ª linha), e o nome lido nele escolhe "Take Ranarr seed" (y=807)
+    original = visao.detectar_itens_chao
+    visao.detectar_itens_chao = lambda *a, **k: []
+    try:
+        rn = visao.detectar_valiosos_chao(rn_img)
+        rp = visao.detectar_valiosos_chao(rp_img) if rp_img is not None else None
+    finally:
+        visao.detectar_itens_chao = original
+    if rp is not None and (len(rp) != 1 or abs(rp[0]["pos"][0] - 932) > 6 or abs(rp[0]["pos"][1] - 709) > 6):
+        falhas.append(f"valiosos: rótulo azul da Ranarr encavalada fora da pilha (932, 709): {[i['pos'] for i in rp]}")
+    if len(rn) != 1 or abs(rn[0]["pos"][0] - 820) > 6 or abs(rn[0]["pos"][1] - 760) > 6:
+        falhas.append(f"valiosos: rótulo azul da Ranarr fora da pilha dela (820, 760): {[i['pos'] for i in rn]}")
+    else:
+        p, nota = visao.achar_take_valioso_no_menu(rn_img, rn[0]["nome"])
+        if p is None or abs(p[1] - 815) > 4:
+            falhas.append(f"valiosos: nome da Ranarr não escolheu 'Take Ranarr seed' ({p}, {nota:.2f})")
+    if sd:
+        for nome in ("ranarr_tela2_menu.png", "snape_menu.png"):
+            p, nota = visao.achar_take_valioso_no_menu(cv2.imread(os.path.join(S, nome)), sd[0]["nome"])
+            if p is not None:
+                falhas.append(f"valiosos: nome da Snapdragon escolheu uma linha em {nome} ({p}, {nota:.2f})")
+    # nenhum rótulo azul nos outros quadros inteiros das amostras
+    quadros = [f for f in sorted(glob.glob(os.path.join(PASTA, "**", "*.png"), recursive=True))
+               if os.path.basename(f) not in ("snapdragon_tela.png", "snapdragon_pilha.png", "ranarr_pilha.png")]
+    vistos = 0
+    for f in quadros:
+        img = cv2.imread(f)
+        if img is None or img.shape[0] < 600 or img.shape[1] < 1000:
+            continue  # recortes (menus, faixas, cliques)
+        vistos += 1
+        a = visao.detectar_valiosos_chao(img)
+        if a:
+            falhas.append(f"valiosos: rótulo azul inexistente em {os.path.relpath(f, PASTA)}: {[i['pos'] for i in a]}")
+    print(f"Valiosos: Snapdragon real, Ranarr (pilha e menu) e {vistos} quadros sem rótulo azul")
+    return falhas
+
+
 # Na ordem da saída. Cada item: (função, argumentos...).
 TESTES = [
     (testar_frames,), (testar_faixas,), (testar_cliques,), (testar_menus,),
     (testar_vida_amostras,), (testar_vida_baixa,), (testar_vida_deslocada,), (testar_vida_cenario,),
     (testar_vigia_vida,), (testar_geometria,), (testar_mochila_aberta,),
     *[t for item in GABARITOS_CHAO for t in ((testar_item_chao, item), (testar_item_menu, item))],
-    (testar_semente,),
+    (testar_semente,), (testar_valiosos,),
     (testar_rotulo_vizinho,), (testar_menu_tem_take,), (testar_take_acao,), (testar_rotulo_novo,),
     (testar_perfis_aprendidos,), (testar_moldes_cruzados,), (testar_mira_por_nome,),
     (testar_matiz_vermelho,), (testar_reconexao,),
